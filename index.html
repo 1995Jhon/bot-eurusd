@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BOT EUR/USD</title>
+
+<style>
+*{
+  box-sizing:border-box;
+}
+
+body{
+  margin:0;
+  background:#0b0f14;
+  color:white;
+  font-family:Arial,sans-serif;
+}
+
+.container{
+  max-width:600px;
+  margin:auto;
+  padding:20px;
+}
+
+h1{
+  text-align:center;
+  color:#00e676;
+  margin-bottom:5px;
+}
+
+.subtitle{
+  text-align:center;
+  color:#aaa;
+  margin-bottom:20px;
+}
+
+.card{
+  background:#151b23;
+  border:1px solid #29313c;
+  border-radius:15px;
+  padding:18px;
+  margin-bottom:15px;
+}
+
+label{
+  display:block;
+  margin-bottom:7px;
+  color:#bbb;
+}
+
+input{
+  width:100%;
+  padding:13px;
+  border-radius:10px;
+  border:1px solid #394451;
+  background:#0d1218;
+  color:white;
+  font-size:16px;
+  margin-bottom:12px;
+}
+
+button{
+  width:100%;
+  padding:15px;
+  border:0;
+  border-radius:10px;
+  background:#00c853;
+  color:white;
+  font-size:17px;
+  font-weight:bold;
+}
+
+button:active{
+  transform:scale(.98);
+}
+
+.status{
+  text-align:center;
+  padding:12px;
+  border-radius:10px;
+  background:#202731;
+  margin-top:15px;
+  color:#ccc;
+}
+
+.signal{
+  text-align:center;
+  font-size:34px;
+  font-weight:bold;
+  padding:25px 10px;
+  border-radius:15px;
+  margin-top:15px;
+  background:#202731;
+}
+
+.call{
+  color:#00e676;
+}
+
+.put{
+  color:#ff5252;
+}
+
+.wait{
+  color:#ffd740;
+}
+
+.data{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+  margin-top:15px;
+}
+
+.box{
+  background:#0d1218;
+  border-radius:10px;
+  padding:15px;
+  text-align:center;
+}
+
+.box small{
+  display:block;
+  color:#888;
+  margin-bottom:5px;
+}
+
+.box strong{
+  font-size:20px;
+}
+
+.note{
+  color:#888;
+  font-size:12px;
+  line-height:1.5;
+  margin-top:15px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>🤖 BOT EUR/USD</h1>
+
+<div class="subtitle">
+RSI + EMA 9/21 · Marco de 5 minutos
+</div>
+
+<div class="card">
+
+<label>API Key de Twelve Data</label>
+
+<input
+id="apiKey"
+type="password"
+placeholder="Pega aquí tu API Key"
+>
+
+<button onclick="iniciarBot()">
+🚀 INICIAR BOT
+</button>
+
+<div id="status" class="status">
+Bot detenido
+</div>
+
+</div>
+
+<div class="card">
+
+<div id="signal" class="signal wait">
+ESPERANDO DATOS
+</div>
+
+<div class="data">
+
+<div class="box">
+<small>EUR/USD</small>
+<strong id="price">---</strong>
+</div>
+
+<div class="box">
+<small>RSI</small>
+<strong id="rsi">---</strong>
+</div>
+
+<div class="box">
+<small>EMA 9</small>
+<strong id="ema9">---</strong>
+</div>
+
+<div class="box">
+<small>EMA 21</small>
+<strong id="ema21">---</strong>
+</div>
+
+</div>
+
+<div class="note">
+La señal es orientativa y no ejecuta operaciones automáticamente.
+CALL = posible subida · PUT = posible bajada ·
+NO OPERAR = condiciones insuficientes.
+</div>
+
+</div>
+
+</div>
+
+<script>
+
+let intervalo=null;
+
+function calcularEMA(datos, periodo){
+
+    if(datos.length < periodo){
+        return null;
+    }
+
+    let multiplicador = 2 / (periodo + 1);
+
+    let ema = datos
+        .slice(0,periodo)
+        .reduce((a,b)=>a+b,0) / periodo;
+
+    for(let i=periodo;i<datos.length;i++){
+
+        ema =
+        ((datos[i]-ema)*multiplicador)+ema;
+    }
+
+    return ema;
+}
+
+
+function calcularRSI(datos,periodo=14){
+
+    if(datos.length < periodo+1){
+        return null;
+    }
+
+    let ganancias=0;
+    let perdidas=0;
+
+    for(let i=1;i<=periodo;i++){
+
+        let cambio=datos[i]-datos[i-1];
+
+        if(cambio>=0){
+            ganancias+=cambio;
+        }else{
+            perdidas+=Math.abs(cambio);
+        }
+    }
+
+    let promedioGanancia=ganancias/periodo;
+    let promedioPerdida=perdidas/periodo;
+
+    for(let i=periodo+1;i<datos.length;i++){
+
+        let cambio=datos[i]-datos[i-1];
+
+        let ganancia=cambio>0?cambio:0;
+        let perdida=cambio<0?Math.abs(cambio):0;
+
+        promedioGanancia=
+        ((promedioGanancia*(periodo-1))+ganancia)/periodo;
+
+        promedioPerdida=
+        ((promedioPerdida*(periodo-1))+perdida)/periodo;
+    }
+
+    if(promedioPerdida===0){
+        return 100;
+    }
+
+    let rs=promedioGanancia/promedioPerdida;
+
+    return 100-(100/(1+rs));
+}
+
+
+async function obtenerDatos(){
+
+    const apiKey=document.getElementById("apiKey").value.trim();
+
+    if(!apiKey){
+
+        document.getElementById("status").innerText=
+        "⚠️ Coloca tu API Key primero";
+
+        return;
+    }
+
+    try{
+
+        document.getElementById("status").innerText=
+        "🟡 Buscando datos EUR/USD...";
+
+        const url=
+        "https://api.twelvedata.com/time_series"+
+        "?symbol=EUR/USD"+
+        "&interval=5min"+
+        "&outputsize=100"+
+        "&apikey="+encodeURIComponent(apiKey);
+
+        const respuesta=await fetch(url);
+
+        const datos=await respuesta.json();
+
+        if(datos.status==="error"){
+
+            throw new Error(
+                datos.message || "Error de API"
+            );
+        }
+
+        if(!datos.values || datos.values.length<30){
+
+            throw new Error(
+                "No hay suficientes datos"
+            );
+        }
+
+        const cierres=
+        datos.values
+        .reverse()
+        .map(x=>parseFloat(x.close));
+
+        analizar(cierres);
+
+    }catch(error){
+
+        document.getElementById("status").innerText=
+        "❌ Error: "+error.message;
+
+        console.log(error);
+    }
+}
+
+
+function analizar(cierres){
+
+    const precio=cierres[cierres.length-1];
+
+    const ema9=calcularEMA(cierres,9);
+    const ema21=calcularEMA(cierres,21);
+    const rsi=calcularRSI(cierres,14);
+
+    if(ema9===null || ema21===null || rsi===null){
+        return;
+    }
+
+    document.getElementById("price").innerText=
+    precio.toFixed(5);
+
+    document.getElementById("ema9").innerText=
+    ema9.toFixed(5);
+
+    document.getElementById("ema21").innerText=
+    ema21.toFixed(5);
+
+    document.getElementById("rsi").innerText=
+    rsi.toFixed(2);
+
+
+    const signal=document.getElementById("signal");
+
+
+    /*
+       REGLAS DEL BOT
+
+       CALL:
+       EMA 9 > EMA 21
+       RSI entre 50 y 70
+
+       PUT:
+       EMA 9 < EMA 21
+       RSI entre 30 y 50
+
+       TODO LO DEMÁS:
+       NO OPERAR
+    */
+
+
+    if(ema9>ema21 && rsi>=50 && rsi<=70){
+
+        signal.innerText="🟢 CALL";
+        signal.className="signal call";
+
+        document.getElementById("status").innerText=
+        "🟢 Señal CALL detectada";
+
+    }
+
+    else if(ema9<ema21 && rsi>=30 && rsi<=50){
+
+        signal.innerText="🔴 PUT";
+        signal.className="signal put";
+
+        document.getElementById("status").innerText=
+        "🔴 Señal PUT detectada";
+
+    }
+
+    else{
+
+        signal.innerText="🟡 NO OPERAR";
+        signal.className="signal wait";
+
+        document.getElementById("status").innerText=
+        "🟡 Esperando una configuración clara";
+    }
+}
+
+
+function iniciarBot(){
+
+    if(intervalo){
+        clearInterval(intervalo);
+    }
+
+    obtenerDatos();
+
+    /*
+      Actualiza aproximadamente cada minuto.
+    */
+
+    intervalo=setInterval(
+        obtenerDatos,
+        60000
+    );
+}
+
+</script>
+
+</body>
+</html>
