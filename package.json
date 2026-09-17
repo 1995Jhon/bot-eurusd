@@ -1,0 +1,14 @@
+{
+  "name": "bot-eurusd",
+  "version": "1.0.0",
+  "description": "Bot EUR/USD con API oficial",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
