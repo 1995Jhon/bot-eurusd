@@ -3,747 +3,693 @@ const cors = require("cors");
 const WebSocket = require("ws");
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// =====================================================
-// CONFIGURACIÓN
-// =====================================================
-
 const API_BASE = "https://api.derivws.com";
-
 const DERIV_TOKEN = process.env.DERIV_TOKEN;
 const DERIV_APP_ID = process.env.DERIV_APP_ID;
 
-const DERIV_ACCOUNT_ID =
-    process.env.DERIV_ACCOUNT_ID || "";
-
 const SYMBOL = "frxEURUSD";
-
 const AMOUNT = 1;
-
 const DURATION = 5;
 const DURATION_UNIT = "m";
 
-// =====================================================
-// SEGURIDAD
-// =====================================================
-
 const MAX_TRADES_PER_HOUR = 5;
+const AUTO_TRADING = process.env.AUTO_TRADING !== "false";
 
 let tradesThisHour = 0;
 let hourStarted = Date.now();
-
 let lastTradeCandle = null;
-
-// =====================================================
-// COMPROBAR CONFIGURACIÓN
-// =====================================================
+let lastSignal = "NO_TRADE";
+let lastAutoRun = null;
+let lastTrade = null;
+let autoBusy = false;
 
 function checkConfig() {
-
-    if (!DERIV_TOKEN) {
-        throw new Error("Falta DERIV_TOKEN en Render");
-    }
-
-    if (!DERIV_APP_ID) {
-        throw new Error("Falta DERIV_APP_ID en Render");
-    }
+  if (!DERIV_TOKEN) throw new Error("Falta DERIV_TOKEN");
+  if (!DERIV_APP_ID) throw new Error("Falta DERIV_APP_ID");
 }
-
-// =====================================================
-// REINICIAR CONTADOR CADA HORA
-// =====================================================
 
 function resetHourlyCounter() {
-
-    const now = Date.now();
-
-    if (
-        now - hourStarted >=
-        60 * 60 * 1000
-    ) {
-
-        tradesThisHour = 0;
-
-        hourStarted = now;
-    }
+  if (Date.now() - hourStarted >= 3600000) {
+    tradesThisHour = 0;
+    hourStarted = Date.now();
+  }
 }
 
-// =====================================================
-// VELA DE 5 MINUTOS
-// =====================================================
-
-function getFiveMinuteCandle() {
-
-    return Math.floor(
-        Date.now() / (5 * 60 * 1000)
-    );
+function candleId() {
+  return Math.floor(Date.now() / 300000);
 }
 
-// =====================================================
-// BUSCAR CUENTA DEMO
-// =====================================================
+async function getDemoAccount() {
+  checkConfig();
 
-async function getDemoAccountId() {
-
-    checkConfig();
-
-    const response = await fetch(
-        `${API_BASE}/trading/v1/options/accounts`,
-        {
-            method: "GET",
-
-            headers: {
-                "Authorization":
-                    `Bearer ${DERIV_TOKEN}`,
-
-                "Deriv-App-ID":
-                    DERIV_APP_ID
-            }
-        }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-
-        throw new Error(
-            data?.errors?.[0]?.message ||
-            "No se pudieron obtener las cuentas de Deriv"
-        );
+  const r = await fetch(
+    `${API_BASE}/trading/v1/options/accounts`,
+    {
+      headers: {
+        Authorization: `Bearer ${DERIV_TOKEN}`,
+        "Deriv-App-ID": DERIV_APP_ID
+      }
     }
+  );
 
-    let accounts = data?.data || [];
+  const data = await r.json();
 
-    if (!Array.isArray(accounts)) {
-        accounts = [accounts];
-    }
-
-    const demoAccount = accounts.find(
-        account =>
-            account.account_type === "demo" &&
-            account.status === "active"
+  if (!r.ok) {
+    throw new Error(
+      data?.errors?.[0]?.message ||
+      "No se pudieron obtener las cuentas"
     );
+  }
 
-    if (!demoAccount?.account_id) {
+  let accounts = data.data || [];
+  if (!Array.isArray(accounts)) accounts = [accounts];
 
-        throw new Error(
-            "No se encontró una cuenta Options DEMO activa"
-        );
-    }
+  const demo = accounts.find(
+    a =>
+      a.account_type === "demo" &&
+      a.status === "active"
+  );
 
-    console.log(
-        "Cuenta DEMO encontrada:",
-        demoAccount.account_id
-    );
+  if (!demo?.account_id) {
+    throw new Error("No se encontró cuenta DEMO activa");
+  }
 
-    return demoAccount.account_id;
+  console.log("Cuenta DEMO:", demo.account_id);
+
+  return demo.account_id;
 }
 
-// =====================================================
-// OBTENER ID DE CUENTA
-// =====================================================
+async function getTradingWebSocket(accountId) {
+  checkConfig();
 
-async function getAccountId() {
-
-    if (DERIV_ACCOUNT_ID) {
-
-        return DERIV_ACCOUNT_ID;
+  const r = await fetch(
+    `${API_BASE}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${DERIV_TOKEN}`,
+        "Deriv-App-ID": DERIV_APP_ID
+      }
     }
+  );
 
-    return await getDemoAccountId();
+  const data = await r.json();
+
+  if (!r.ok) {
+    throw new Error(
+      data?.errors?.[0]?.message ||
+      "No se pudo obtener OTP"
+    );
+  }
+
+  if (!data?.data?.url) {
+    throw new Error("Deriv no devolvió WebSocket");
+  }
+
+  return data.data.url;
 }
 
-// =====================================================
-// OBTENER WEBSOCKET AUTENTICADO
-// =====================================================
-
-async function getWebSocketUrl(accountId) {
-
-    checkConfig();
-
-    const url =
-        `${API_BASE}/trading/v1/options/accounts/` +
-        `${encodeURIComponent(accountId)}/otp`;
-
-    const response = await fetch(
-        url,
-        {
-            method: "POST",
-
-            headers: {
-                "Authorization":
-                    `Bearer ${DERIV_TOKEN}`,
-
-                "Deriv-App-ID":
-                    DERIV_APP_ID
-            }
-        }
+function getCandles() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(
+      `${API_BASE}/trading/v1/options/ws/public`
     );
 
-    const data = await response.json();
+    let done = false;
 
-    if (!response.ok) {
+    const timeout = setTimeout(() => {
+      finish(
+        reject,
+        new Error("Timeout obteniendo EUR/USD")
+      );
+    }, 15000);
 
-        throw new Error(
-            data?.errors?.[0]?.message ||
-            "No se pudo obtener el WebSocket de Deriv"
-        );
+    function finish(fn, value) {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch {}
+
+      fn(value);
     }
 
-    if (!data?.data?.url) {
-
-        throw new Error(
-            "Deriv no devolvió una URL WebSocket válida"
-        );
-    }
-
-    return data.data.url;
-}
-
-// =====================================================
-// EJECUTAR OPERACIÓN
-// =====================================================
-
-function executeTrade(direction) {
-
-    return new Promise(async (resolve, reject) => {
-
-        let ws = null;
-
-        try {
-
-            checkConfig();
-
-            // -----------------------------------------
-            // VALIDAR SEÑAL
-            // -----------------------------------------
-
-            if (
-                direction !== "CALL" &&
-                direction !== "PUT"
-            ) {
-
-                return reject(
-                    new Error(
-                        "La señal debe ser CALL o PUT"
-                    )
-                );
-            }
-
-            // -----------------------------------------
-            // CONTROL HORARIO
-            // -----------------------------------------
-
-            resetHourlyCounter();
-
-            if (
-                tradesThisHour >=
-                MAX_TRADES_PER_HOUR
-            ) {
-
-                return reject(
-                    new Error(
-                        "Límite de seguridad: 5 operaciones por hora"
-                    )
-                );
-            }
-
-            // -----------------------------------------
-            // UNA OPERACIÓN POR VELA
-            // -----------------------------------------
-
-            const candle =
-                getFiveMinuteCandle();
-
-            if (lastTradeCandle === candle) {
-
-                return reject(
-                    new Error(
-                        "Ya se ejecutó una operación en esta vela de 5 minutos"
-                    )
-                );
-            }
-
-            // -----------------------------------------
-            // CUENTA DEMO
-            // -----------------------------------------
-
-            const accountId =
-                await getAccountId();
-
-            console.log(
-                "Cuenta utilizada:",
-                accountId
-            );
-
-            // -----------------------------------------
-            // WEBSOCKET
-            // -----------------------------------------
-
-            const wsUrl =
-                await getWebSocketUrl(
-                    accountId
-                );
-
-            ws = new WebSocket(wsUrl);
-
-            let finished = false;
-
-            const timeout =
-                setTimeout(() => {
-
-                    if (!finished) {
-
-                        finished = true;
-
-                        try {
-                            ws.close();
-                        } catch {}
-
-                        reject(
-                            new Error(
-                                "Tiempo de espera agotado con Deriv"
-                            )
-                        );
-                    }
-
-                }, 15000);
-
-            // -----------------------------------------
-            // CONEXIÓN
-            // -----------------------------------------
-
-            ws.on("open", () => {
-
-                console.log(
-                    "WebSocket conectado"
-                );
-
-                console.log(
-                    `Solicitando propuesta ${direction}`
-                );
-
-                ws.send(
-                    JSON.stringify({
-
-                        proposal: 1,
-
-                        amount: AMOUNT,
-
-                        basis: "stake",
-
-                        contract_type:
-                            direction,
-
-                        currency: "USD",
-
-                        duration: DURATION,
-
-                        duration_unit:
-                            DURATION_UNIT,
-
-                        underlying_symbol:
-                            SYMBOL,
-
-                        req_id: 1
-                    })
-                );
-            });
-
-            // -----------------------------------------
-            // MENSAJES
-            // -----------------------------------------
-
-            ws.on("message", (raw) => {
-
-                try {
-
-                    const data =
-                        JSON.parse(
-                            raw.toString()
-                        );
-
-                    console.log(
-                        "Deriv:",
-                        JSON.stringify(data)
-                    );
-
-                    // ---------------------------------
-                    // ERROR
-                    // ---------------------------------
-
-                    if (data.error) {
-
-                        if (!finished) {
-
-                            finished = true;
-
-                            clearTimeout(
-                                timeout
-                            );
-
-                            try {
-                                ws.close();
-                            } catch {}
-
-                            reject(
-                                new Error(
-                                    data.error.message ||
-                                    "Error de Deriv"
-                                )
-                            );
-                        }
-
-                        return;
-                    }
-
-                    // ---------------------------------
-                    // PROPUESTA
-                    // ---------------------------------
-
-                    if (
-                        data.msg_type ===
-                            "proposal" &&
-                        data.proposal
-                    ) {
-
-                        const proposalId =
-                            data.proposal.id;
-
-                        const askPrice =
-                            Number(
-                                data.proposal.ask_price
-                            );
-
-                        if (
-                            !proposalId ||
-                            !Number.isFinite(
-                                askPrice
-                            )
-                        ) {
-
-                            if (!finished) {
-
-                                finished = true;
-
-                                clearTimeout(
-                                    timeout
-                                );
-
-                                try {
-                                    ws.close();
-                                } catch {}
-
-                                reject(
-                                    new Error(
-                                        "Propuesta inválida"
-                                    )
-                                );
-                            }
-
-                            return;
-                        }
-
-                        console.log(
-                            "Propuesta recibida:",
-                            proposalId
-                        );
-
-                        // ---------------------------------
-                        // COMPRAR
-                        // ---------------------------------
-
-                        ws.send(
-                            JSON.stringify({
-
-                                buy:
-                                    proposalId,
-
-                                price:
-                                    askPrice,
-
-                                req_id: 2
-                            })
-                        );
-
-                        return;
-                    }
-
-                    // ---------------------------------
-                    // COMPRA CONFIRMADA
-                    // ---------------------------------
-
-                    if (
-                        data.msg_type === "buy" &&
-                        data.buy
-                    ) {
-
-                        const contractId =
-                            data.buy.contract_id;
-
-                        tradesThisHour++;
-
-                        lastTradeCandle =
-                            candle;
-
-                        if (!finished) {
-
-                            finished = true;
-
-                            clearTimeout(
-                                timeout
-                            );
-
-                            try {
-                                ws.close();
-                            } catch {}
-
-                            resolve({
-
-                                success: true,
-
-                                mode: "DEMO",
-
-                                symbol: SYMBOL,
-
-                                direction:
-                                    direction,
-
-                                amount:
-                                    AMOUNT,
-
-                                duration:
-                                    `${DURATION} ${DURATION_UNIT}`,
-
-                                contract_id:
-                                    contractId,
-
-                                account_id:
-                                    accountId,
-
-                                trades_this_hour:
-                                    tradesThisHour
-                            });
-                        }
-                    }
-
-                } catch (error) {
-
-                    if (!finished) {
-
-                        finished = true;
-
-                        clearTimeout(
-                            timeout
-                        );
-
-                        try {
-                            ws.close();
-                        } catch {}
-
-                        reject(error);
-                    }
-                }
-            });
-
-            // -----------------------------------------
-            // ERROR WEBSOCKET
-            // -----------------------------------------
-
-            ws.on("error", (error) => {
-
-                if (!finished) {
-
-                    finished = true;
-
-                    clearTimeout(
-                        timeout
-                    );
-
-                    reject(error);
-                }
-            });
-
-            // -----------------------------------------
-            // CERRAR
-            // -----------------------------------------
-
-            ws.on("close", () => {
-
-                console.log(
-                    "WebSocket cerrado"
-                );
-            });
-
-        } catch (error) {
-
-            reject(error);
-        }
+    ws.on("open", () => {
+      console.log("Mercado EUR/USD conectado");
+
+      ws.send(
+        JSON.stringify({
+          ticks_history: SYMBOL,
+          end: "latest",
+          count: 100,
+          style: "candles",
+          granularity: 300,
+          subscribe: 0,
+          req_id: 1
+        })
+      );
     });
-}
 
-// =====================================================
-// RUTA PRINCIPAL
-// =====================================================
+    ws.on("message", raw => {
+      try {
+        const data = JSON.parse(raw.toString());
 
-app.get("/", (req, res) => {
-
-    res.json({
-
-        bot:
-            "EUR/USD Auto Trader",
-
-        status:
-            "online",
-
-        mode:
-            "DEMO",
-
-        symbol:
-            SYMBOL,
-
-        amount:
-            AMOUNT,
-
-        duration:
-            `${DURATION} ${DURATION_UNIT}`,
-
-        account:
-            "AUTO-DEMO"
-    });
-});
-
-// =====================================================
-// PRUEBA DE CUENTA
-// IMPORTANTE: NO REALIZA NINGUNA OPERACIÓN
-// =====================================================
-
-app.get("/account-test", async (req, res) => {
-
-    try {
-
-        const accountId =
-            await getAccountId();
-
-        res.json({
-
-            success: true,
-
-            mode: "DEMO",
-
-            account_id:
-                accountId
-        });
-
-    } catch (error) {
-
-        res.status(500).json({
-
-            success: false,
-
-            error:
-                error.message
-        });
-    }
-});
-
-// =====================================================
-// RUTA PARA EJECUTAR OPERACIÓN
-// =====================================================
-
-app.post("/trade", async (req, res) => {
-
-    try {
-
-        const signal =
-            String(
-                req.body.signal || ""
-            ).toUpperCase();
+        if (data.error) {
+          return finish(
+            reject,
+            new Error(data.error.message)
+          );
+        }
 
         if (
-            signal !== "CALL" &&
-            signal !== "PUT"
+          data.msg_type === "candles" &&
+          Array.isArray(data.candles)
         ) {
+          const candles = data.candles
+            .map(c => ({
+              open: Number(c.open),
+              high: Number(c.high),
+              low: Number(c.low),
+              close: Number(c.close),
+              epoch: Number(c.epoch)
+            }))
+            .filter(c => Number.isFinite(c.close));
 
-            return res.status(400).json({
+          if (candles.length < 30) {
+            return finish(
+              reject,
+              new Error("No hay suficientes velas")
+            );
+          }
 
-                success: false,
-
-                error:
-                    "La señal debe ser CALL o PUT"
-            });
+          finish(resolve, candles);
         }
+      } catch (e) {
+        finish(reject, e);
+      }
+    });
 
+    ws.on("error", e => finish(reject, e));
+  });
+}
+
+function ema(values, period) {
+  if (values.length < period) return null;
+
+  const k = 2 / (period + 1);
+
+  let result =
+    values
+      .slice(0, period)
+      .reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+    result =
+      values[i] * k +
+      result * (1 - k);
+  }
+
+  return result;
+}
+
+function rsi(values, period = 14) {
+  if (values.length <= period) return null;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = 1; i <= period; i++) {
+    const change =
+      values[i] - values[i - 1];
+
+    if (change >= 0) gains += change;
+    else losses += Math.abs(change);
+  }
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (
+    let i = period + 1;
+    i < values.length;
+    i++
+  ) {
+    const change =
+      values[i] - values[i - 1];
+
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
+
+    avgGain =
+      (avgGain * (period - 1) + gain) /
+      period;
+
+    avgLoss =
+      (avgLoss * (period - 1) + loss) /
+      period;
+  }
+
+  if (avgLoss === 0) return 100;
+
+  const rs = avgGain / avgLoss;
+
+  return 100 - 100 / (1 + rs);
+}
+
+function getSignal(candles) {
+  const closes = candles.map(c => c.close);
+
+  const fast = ema(closes, 9);
+  const slow = ema(closes, 21);
+  const current = closes.at(-1);
+  const previous = closes.at(-2);
+  const r = rsi(closes, 14);
+
+  if (
+    ![fast, slow, current, previous, r]
+      .every(Number.isFinite)
+  ) {
+    return null;
+  }
+
+  if (
+    fast > slow &&
+    r >= 50 &&
+    r <= 70 &&
+    current > previous
+  ) {
+    return "CALL";
+  }
+
+  if (
+    fast < slow &&
+    r >= 30 &&
+    r <= 50 &&
+    current < previous
+  ) {
+    return "PUT";
+  }
+
+  return null;
+}
+
+function executeTrade(direction) {
+  return new Promise(async (resolve, reject) => {
+    let ws;
+
+    try {
+      checkConfig();
+
+      resetHourlyCounter();
+
+      if (tradesThisHour >= MAX_TRADES_PER_HOUR) {
+        throw new Error(
+          "Límite de 5 operaciones por hora"
+        );
+      }
+
+      const candle = candleId();
+
+      if (lastTradeCandle === candle) {
+        throw new Error(
+          "Ya hubo una operación en esta vela"
+        );
+      }
+
+      const accountId =
+        await getDemoAccount();
+
+      const url =
+        await getTradingWebSocket(accountId);
+
+      ws = new WebSocket(url);
+
+      let finished = false;
+
+      const timeout = setTimeout(() => {
+        if (!finished) {
+          finished = true;
+
+          try {
+            ws.close();
+          } catch {}
+
+          reject(
+            new Error(
+              "Timeout con Deriv"
+            )
+          );
+        }
+      }, 15000);
+
+      ws.on("open", () => {
         console.log(
-            `Señal recibida: ${signal}`
+          `WebSocket DEMO conectado | ${direction}`
         );
 
-        const result =
-            await executeTrade(
-                signal
+        ws.send(
+          JSON.stringify({
+            proposal: 1,
+            amount: AMOUNT,
+            basis: "stake",
+            contract_type: direction,
+            currency: "USD",
+            duration: DURATION,
+            duration_unit: DURATION_UNIT,
+            underlying_symbol: SYMBOL,
+            req_id: 1
+          })
+        );
+      });
+
+      ws.on("message", raw => {
+        try {
+          const data =
+            JSON.parse(raw.toString());
+
+          console.log(
+            "Deriv:",
+            JSON.stringify(data)
+          );
+
+          if (data.error) {
+            if (!finished) {
+              finished = true;
+              clearTimeout(timeout);
+
+              try {
+                ws.close();
+              } catch {}
+
+              reject(
+                new Error(
+                  data.error.message ||
+                  "Error de Deriv"
+                )
+              );
+            }
+
+            return;
+          }
+
+          if (
+            data.msg_type === "proposal" &&
+            data.proposal?.id
+          ) {
+            const proposalId =
+              data.proposal.id;
+
+            const price =
+              Number(
+                data.proposal.ask_price
+              );
+
+            if (!Number.isFinite(price)) {
+              throw new Error(
+                "Precio de propuesta inválido"
+              );
+            }
+
+            console.log(
+              "Propuesta:",
+              proposalId
             );
 
-        res.json(result);
+            ws.send(
+              JSON.stringify({
+                buy: proposalId,
+                price: price,
+                req_id: 2
+              })
+            );
 
-    } catch (error) {
+            return;
+          }
 
-        console.error(
-            "ERROR:",
-            error.message
-        );
+          if (
+            data.msg_type === "buy" &&
+            data.buy
+          ) {
+            tradesThisHour++;
+            lastTradeCandle = candle;
 
-        res.status(500).json({
+            lastTrade = {
+              time: new Date().toISOString(),
+              direction,
+              amount: AMOUNT,
+              duration: `${DURATION}m`,
+              contract_id:
+                data.buy.contract_id,
+              account_id: accountId
+            };
 
-            success: false,
+            if (!finished) {
+              finished = true;
+              clearTimeout(timeout);
 
-            error:
-                error.message
-        });
+              try {
+                ws.close();
+              } catch {}
+
+              console.log(
+                "OPERACIÓN DEMO CONFIRMADA",
+                JSON.stringify(lastTrade)
+              );
+
+              resolve(lastTrade);
+            }
+          }
+        } catch (e) {
+          if (!finished) {
+            finished = true;
+            clearTimeout(timeout);
+
+            try {
+              ws.close();
+            } catch {}
+
+            reject(e);
+          }
+        }
+      });
+
+      ws.on("error", e => {
+        if (!finished) {
+          finished = true;
+          clearTimeout(timeout);
+          reject(e);
+        }
+      });
+
+    } catch (e) {
+      reject(e);
     }
+  });
+}
+
+async function runAutoTrader() {
+  if (!AUTO_TRADING || autoBusy) return;
+
+  autoBusy = true;
+  lastAutoRun =
+    new Date().toISOString();
+
+  try {
+    console.log(
+      "=============================="
+    );
+
+    console.log(
+      "AUTO | Analizando EUR/USD..."
+    );
+
+    const candles =
+      await getCandles();
+
+    const closes =
+      candles.map(c => c.close);
+
+    const fast =
+      ema(closes, 9);
+
+    const slow =
+      ema(closes, 21);
+
+    const currentRsi =
+      rsi(closes, 14);
+
+    const signal =
+      getSignal(candles);
+
+    lastSignal =
+      signal || "NO_TRADE";
+
+    console.log(
+      `AUTO | EMA9=${fast?.toFixed(6)}`
+    );
+
+    console.log(
+      `AUTO | EMA21=${slow?.toFixed(6)}`
+    );
+
+    console.log(
+      `AUTO | RSI14=${currentRsi?.toFixed(2)}`
+    );
+
+    console.log(
+      `AUTO | SEÑAL=${lastSignal}`
+    );
+
+    if (!signal) {
+      console.log(
+        "AUTO | Sin operación"
+      );
+
+      return;
+    }
+
+    console.log(
+      `AUTO | Ejecutando ${signal} DEMO $${AMOUNT}`
+    );
+
+    await executeTrade(signal);
+
+  } catch (e) {
+    console.error(
+      "AUTO | ERROR:",
+      e.message
+    );
+  } finally {
+    autoBusy = false;
+  }
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    bot: "EUR/USD Auto Trader",
+    status: "online",
+    mode: "DEMO",
+    symbol: SYMBOL,
+    amount: AMOUNT,
+    duration: "5m",
+    auto_trading: AUTO_TRADING,
+    last_signal: lastSignal,
+    last_auto_run: lastAutoRun,
+    last_trade: lastTrade
+  });
 });
 
-// =====================================================
-// SERVIDOR
-// =====================================================
+app.get("/account-test", async (req, res) => {
+  try {
+    const account =
+      await getDemoAccount();
+
+    res.json({
+      success: true,
+      mode: "DEMO",
+      account_id: account
+    });
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+app.post("/trade", async (req, res) => {
+  try {
+    const signal =
+      String(
+        req.body.signal || ""
+      ).toUpperCase();
+
+    if (
+      signal !== "CALL" &&
+      signal !== "PUT"
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Usa CALL o PUT"
+      });
+    }
+
+    const result =
+      await executeTrade(signal);
+
+    res.json({
+      success: true,
+      mode: "DEMO",
+      result
+    });
+
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
 
 app.listen(PORT, () => {
+  console.log(
+    `Bot ejecutándose en puerto ${PORT}`
+  );
 
+  console.log(
+    "================================"
+  );
+
+  console.log(
+    "MODO: DEMO"
+  );
+
+  console.log(
+    `EUR/USD: ${SYMBOL}`
+  );
+
+  console.log(
+    `Monto: $${AMOUNT}`
+  );
+
+  console.log(
+    "Duración: 5 minutos"
+  );
+
+  console.log(
+    `Auto trading: ${AUTO_TRADING}`
+  );
+
+  console.log(
+    "TOKEN:",
+    Boolean(DERIV_TOKEN)
+  );
+
+  console.log(
+    "APP ID:",
+    Boolean(DERIV_APP_ID)
+  );
+
+  if (AUTO_TRADING) {
     console.log(
-        `Bot ejecutándose en puerto ${PORT}`
+      "AUTO | Monitor iniciado"
     );
 
-    console.log(
-        "Modo: DEMO"
+    setTimeout(
+      runAutoTrader,
+      5000
     );
 
-    console.log(
-        `Símbolo: ${SYMBOL}`
+    setInterval(
+      runAutoTrader,
+      5 * 60 * 1000
     );
-
-    console.log(
-        `Monto: $${AMOUNT}`
-    );
-
-    console.log(
-        `Duración: ${DURATION} minutos`
-    );
-
-    console.log(
-        "Cuenta: automática"
-    );
-
-    console.log(
-        "DERIV_TOKEN configurado:",
-        Boolean(process.env.DERIV_TOKEN)
-    );
-
-    console.log(
-        "DERIV_APP_ID configurado:",
-        Boolean(process.env.DERIV_APP_ID)
-    );
+  }
 });
