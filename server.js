@@ -11,13 +11,32 @@ const PORT = process.env.PORT || 3000;
 
 const API_BASE = "https://api.derivws.com";
 
-const DERIV_TOKEN = process.env.DERIV_TOKEN;
-const DERIV_APP_ID = process.env.DERIV_APP_ID;
+const DERIV_TOKEN =
+  process.env.DERIV_TOKEN;
+
+const DERIV_APP_ID =
+  process.env.DERIV_APP_ID;
+
+/* =========================
+   CONFIGURACIÓN
+========================= */
 
 const SYMBOL = "frxEURUSD";
 
 const AMOUNT = 1;
-const DURATION = 5;
+
+/*
+   El bot intentará estas duraciones
+   automáticamente si una no está disponible.
+*/
+const DURATIONS = [
+  1,
+  2,
+  3,
+  5,
+  10
+];
+
 const DURATION_UNIT = "m";
 
 const MAX_TRADES_PER_HOUR = 5;
@@ -25,41 +44,68 @@ const MAX_TRADES_PER_HOUR = 5;
 const AUTO_TRADING =
   process.env.AUTO_TRADING !== "false";
 
+/* =========================
+   ESTADO
+========================= */
+
 let tradesThisHour = 0;
-let hourStarted = Date.now();
 
-let lastTradeCandle = null;
-let lastSignal = "NO_TRADE";
-let lastAutoRun = null;
-let lastTrade = null;
+let hourStarted =
+  Date.now();
 
-let autoBusy = false;
+let lastTradeCandle =
+  null;
+
+let lastSignal =
+  "NO_TRADE";
+
+let lastAutoRun =
+  null;
+
+let lastTrade =
+  null;
+
+let autoBusy =
+  false;
 
 /* =========================
    CONFIGURACIÓN
 ========================= */
 
 function checkConfig() {
+
   if (!DERIV_TOKEN) {
-    throw new Error("Falta DERIV_TOKEN");
+    throw new Error(
+      "Falta DERIV_TOKEN"
+    );
   }
 
   if (!DERIV_APP_ID) {
-    throw new Error("Falta DERIV_APP_ID");
+    throw new Error(
+      "Falta DERIV_APP_ID"
+    );
   }
 }
 
 /* =========================
-   CONTROL DE OPERACIONES
+   CONTADOR HORARIO
 ========================= */
 
 function resetHourlyCounter() {
+
+  const hour =
+    60 * 60 * 1000;
+
   if (
-    Date.now() - hourStarted >=
-    60 * 60 * 1000
+    Date.now() -
+      hourStarted >=
+    hour
   ) {
+
     tradesThisHour = 0;
-    hourStarted = Date.now();
+
+    hourStarted =
+      Date.now();
 
     console.log(
       "AUTO | Contador horario reiniciado"
@@ -67,9 +113,19 @@ function resetHourlyCounter() {
   }
 }
 
+/* =========================
+   IDENTIFICADOR DE VELA
+========================= */
+
 function getCandleId() {
+
   return Math.floor(
-    Date.now() / (5 * 60 * 1000)
+    Date.now() /
+      (
+        5 *
+        60 *
+        1000
+      )
   );
 }
 
@@ -78,29 +134,33 @@ function getCandleId() {
 ========================= */
 
 async function getDemoAccount() {
+
   checkConfig();
 
-  const response = await fetch(
-    `${API_BASE}/trading/v1/options/accounts`,
-    {
-      method: "GET",
-      headers: {
-        Authorization:
-          `Bearer ${DERIV_TOKEN}`,
+  const response =
+    await fetch(
+      `${API_BASE}/trading/v1/options/accounts`,
+      {
+        method: "GET",
 
-        "Deriv-App-ID":
-          DERIV_APP_ID,
+        headers: {
+          Authorization:
+            `Bearer ${DERIV_TOKEN}`,
 
-        Accept:
-          "application/json"
+          "Deriv-App-ID":
+            DERIV_APP_ID,
+
+          Accept:
+            "application/json"
+        }
       }
-    }
-  );
+    );
 
   const data =
     await response.json();
 
   if (!response.ok) {
+
     throw new Error(
       data?.errors?.[0]?.message ||
       "No se pudieron obtener las cuentas"
@@ -110,8 +170,13 @@ async function getDemoAccount() {
   let accounts =
     data.data || [];
 
-  if (!Array.isArray(accounts)) {
-    accounts = [accounts];
+  if (
+    !Array.isArray(accounts)
+  ) {
+
+    accounts = [
+      accounts
+    ];
   }
 
   const demo =
@@ -123,7 +188,10 @@ async function getDemoAccount() {
           "active"
     );
 
-  if (!demo?.account_id) {
+  if (
+    !demo?.account_id
+  ) {
+
     throw new Error(
       "No se encontró una cuenta DEMO activa"
     );
@@ -144,6 +212,7 @@ async function getDemoAccount() {
 async function getTradingWebSocket(
   accountId
 ) {
+
   checkConfig();
 
   const response =
@@ -169,9 +238,10 @@ async function getTradingWebSocket(
     await response.json();
 
   if (!response.ok) {
+
     throw new Error(
       data?.errors?.[0]?.message ||
-      "No se pudo obtener el WebSocket"
+      "No se pudo obtener WebSocket"
     );
   }
 
@@ -179,8 +249,9 @@ async function getTradingWebSocket(
     data?.data?.url;
 
   if (!url) {
+
     throw new Error(
-      "Deriv no devolvió una URL WebSocket"
+      "Deriv no devolvió URL WebSocket"
     );
   }
 
@@ -192,10 +263,11 @@ async function getTradingWebSocket(
 }
 
 /* =========================
-   DATOS EUR/USD
+   VELAS EUR/USD
 ========================= */
 
 function getCandles() {
+
   return new Promise(
     (resolve, reject) => {
 
@@ -204,73 +276,86 @@ function getCandles() {
           `${API_BASE}/trading/v1/options/ws/public`
         );
 
-      let finished = false;
+      let finished =
+        false;
 
       const timeout =
-        setTimeout(() => {
+        setTimeout(
+          () => {
 
-          finish(
-            reject,
-            new Error(
-              "Timeout obteniendo datos EUR/USD"
-            )
-          );
+            finish(
+              reject,
+              new Error(
+                "Timeout obteniendo EUR/USD"
+              )
+            );
 
-        }, 15000);
+          },
+          15000
+        );
 
       function finish(
         callback,
         value
       ) {
-        if (finished) return;
+
+        if (finished) {
+          return;
+        }
 
         finished = true;
 
-        clearTimeout(timeout);
+        clearTimeout(
+          timeout
+        );
 
         try {
           ws.close();
         } catch {}
 
-        callback(value);
+        callback(
+          value
+        );
       }
 
-      ws.on("open", () => {
+      ws.on(
+        "open",
+        () => {
 
-        console.log(
-          "Mercado EUR/USD conectado"
-        );
+          console.log(
+            "Mercado EUR/USD conectado"
+          );
 
-        /*
-          IMPORTANTE:
-          No usamos subscribe aquí.
-          Es una petición única de historial.
-        */
+          /*
+             IMPORTANTE:
+             No usamos subscribe.
+             Solo pedimos historial.
+          */
 
-        const request = {
-          ticks_history:
-            SYMBOL,
+          ws.send(
+            JSON.stringify({
 
-          end:
-            "latest",
+              ticks_history:
+                SYMBOL,
 
-          count:
-            100,
+              end:
+                "latest",
 
-          style:
-            "candles",
+              count:
+                100,
 
-          granularity:
-            300,
+              style:
+                "candles",
 
-          req_id:
-            1
-        };
+              granularity:
+                300,
 
-        ws.send(
-          JSON.stringify(request)
-        );
-      });
+              req_id:
+                1
+            })
+          );
+        }
+      );
 
       ws.on(
         "message",
@@ -283,13 +368,15 @@ function getCandles() {
                 raw.toString()
               );
 
-            if (data.error) {
+            if (
+              data.error
+            ) {
 
               return finish(
                 reject,
                 new Error(
                   data.error.message ||
-                  "Error obteniendo mercado"
+                  "Error de mercado"
                 )
               );
             }
@@ -306,6 +393,7 @@ function getCandles() {
                 data.candles
                   .map(
                     candle => ({
+
                       open:
                         Number(
                           candle.open
@@ -362,7 +450,9 @@ function getCandles() {
               );
             }
 
-          } catch (error) {
+          } catch (
+            error
+          ) {
 
             finish(
               reject,
@@ -399,12 +489,16 @@ function ema(
     values.length <
     period
   ) {
+
     return null;
   }
 
   const multiplier =
     2 /
-    (period + 1);
+    (
+      period +
+      1
+    );
 
   let result =
     values
@@ -413,8 +507,12 @@ function ema(
         period
       )
       .reduce(
-        (sum, value) =>
-          sum + value,
+        (
+          sum,
+          value
+        ) =>
+          sum +
+          value,
         0
       ) /
     period;
@@ -429,7 +527,10 @@ function ema(
       values[i] *
         multiplier +
       result *
-        (1 - multiplier);
+        (
+          1 -
+          multiplier
+        );
   }
 
   return result;
@@ -448,10 +549,12 @@ function rsi(
     values.length <=
     period
   ) {
+
     return null;
   }
 
   let gains = 0;
+
   let losses = 0;
 
   for (
@@ -467,21 +570,30 @@ function rsi(
     if (
       change >= 0
     ) {
-      gains += change;
+
+      gains +=
+        change;
+
     } else {
+
       losses +=
-        Math.abs(change);
+        Math.abs(
+          change
+        );
     }
   }
 
   let averageGain =
-    gains / period;
+    gains /
+    period;
 
   let averageLoss =
-    losses / period;
+    losses /
+    period;
 
   for (
-    let i = period + 1;
+    let i =
+      period + 1;
     i < values.length;
     i++
   ) {
@@ -505,7 +617,10 @@ function rsi(
     averageGain =
       (
         averageGain *
-          (period - 1) +
+          (
+            period -
+            1
+          ) +
         gain
       ) /
       period;
@@ -513,19 +628,24 @@ function rsi(
     averageLoss =
       (
         averageLoss *
-          (period - 1) +
+          (
+            period -
+            1
+          ) +
         loss
       ) /
       period;
   }
 
   if (
-    averageLoss === 0
+    averageLoss ===
+    0
   ) {
+
     return 100;
   }
 
-  const relativeStrength =
+  const rs =
     averageGain /
     averageLoss;
 
@@ -534,7 +654,7 @@ function rsi(
     100 /
       (
         1 +
-        relativeStrength
+        rs
       )
   );
 }
@@ -567,12 +687,14 @@ function getSignal(
 
   const current =
     closes[
-      closes.length - 1
+      closes.length -
+      1
     ];
 
   const previous =
     closes[
-      closes.length - 2
+      closes.length -
+      2
     ];
 
   const currentRsi =
@@ -592,38 +714,43 @@ function getSignal(
       Number.isFinite
     )
   ) {
+
     return null;
   }
 
   /*
-    CALL:
-    EMA9 > EMA21
-    RSI 50-70
-    precio actual > anterior
+     CALL
   */
 
   if (
-    ema9 > ema21 &&
-    currentRsi >= 50 &&
-    currentRsi <= 70 &&
-    current > previous
+    ema9 >
+      ema21 &&
+    currentRsi >=
+      50 &&
+    currentRsi <=
+      70 &&
+    current >
+      previous
   ) {
+
     return "CALL";
   }
 
   /*
-    PUT:
-    EMA9 < EMA21
-    RSI 30-50
-    precio actual < anterior
+     PUT
   */
 
   if (
-    ema9 < ema21 &&
-    currentRsi >= 30 &&
-    currentRsi <= 50 &&
-    current < previous
+    ema9 <
+      ema21 &&
+    currentRsi >=
+      30 &&
+    currentRsi <=
+      50 &&
+    current <
+      previous
   ) {
+
     return "PUT";
   }
 
@@ -631,7 +758,7 @@ function getSignal(
 }
 
 /* =========================
-   EJECUTAR OPERACIÓN DEMO
+   EJECUTAR TRADE
 ========================= */
 
 function executeTrade(
@@ -691,37 +818,51 @@ function executeTrade(
         let finished =
           false;
 
+        let durationIndex =
+          0;
+
+        let selectedDuration =
+          null;
+
         const timeout =
-          setTimeout(() => {
+          setTimeout(
+            () => {
 
-            if (
-              finished
-            ) {
-              return;
-            }
+              if (
+                finished
+              ) {
+                return;
+              }
 
-            finished = true;
+              finished =
+                true;
 
-            try {
-              ws.close();
-            } catch {}
+              try {
+                ws.close();
+              } catch {}
 
-            reject(
-              new Error(
-                "Timeout con Deriv"
-              )
-            );
+              reject(
+                new Error(
+                  "Timeout con Deriv"
+                )
+              );
 
-          }, 20000);
+            },
+            30000
+          );
 
-        function closeAndResolve(
+        function closeResolve(
           result
         ) {
 
-          if (finished)
+          if (
+            finished
+          ) {
             return;
+          }
 
-          finished = true;
+          finished =
+            true;
 
           clearTimeout(
             timeout
@@ -731,17 +872,23 @@ function executeTrade(
             ws.close();
           } catch {}
 
-          resolve(result);
+          resolve(
+            result
+          );
         }
 
-        function closeAndReject(
+        function closeReject(
           error
         ) {
 
-          if (finished)
+          if (
+            finished
+          ) {
             return;
+          }
 
-          finished = true;
+          finished =
+            true;
 
           clearTimeout(
             timeout
@@ -751,22 +898,36 @@ function executeTrade(
             ws.close();
           } catch {}
 
-          reject(error);
+          reject(
+            error
+          );
         }
 
-        ws.on(
-          "open",
-          () => {
+        function sendProposal() {
 
-            console.log(
-              `DEMO | WebSocket conectado | ${direction}`
+          if (
+            durationIndex >=
+            DURATIONS.length
+          ) {
+
+            return closeReject(
+              new Error(
+                "No hay una duración disponible para este contrato en este momento"
+              )
             );
+          }
 
-            /*
-              Propuesta CALL/PUT
-            */
+          selectedDuration =
+            DURATIONS[
+              durationIndex
+            ];
 
-            const proposal = {
+          console.log(
+            `DEMO | Probando duración ${selectedDuration} minutos`
+          );
+
+          ws.send(
+            JSON.stringify({
 
               proposal:
                 1,
@@ -784,7 +945,7 @@ function executeTrade(
                 "USD",
 
               duration:
-                DURATION,
+                selectedDuration,
 
               duration_unit:
                 DURATION_UNIT,
@@ -793,14 +954,21 @@ function executeTrade(
                 SYMBOL,
 
               req_id:
-                10
-            };
+                100 +
+                durationIndex
+            })
+          );
+        }
 
-            ws.send(
-              JSON.stringify(
-                proposal
-              )
+        ws.on(
+          "open",
+          () => {
+
+            console.log(
+              `DEMO | WebSocket conectado | ${direction}`
             );
+
+            sendProposal();
           }
         );
 
@@ -815,25 +983,60 @@ function executeTrade(
                   raw.toString()
                 );
 
+              /*
+                 ERROR DE DERIV
+              */
+
               if (
                 data.error
               ) {
 
+                const message =
+                  data.error.message ||
+                  "Error de Deriv";
+
                 console.error(
                   "DEMO | Error:",
-                  data.error.message
+                  message
                 );
 
-                return closeAndReject(
+                /*
+                   Si la duración no está disponible,
+                   probamos automáticamente la siguiente.
+                */
+
+                if (
+                  message
+                    .toLowerCase()
+                    .includes(
+                      "not offered for this duration"
+                    )
+                ) {
+
+                  durationIndex++;
+
+                  console.log(
+                    `DEMO | Duración ${selectedDuration} no disponible`
+                  );
+
+                  console.log(
+                    "DEMO | Probando siguiente duración..."
+                  );
+
+                  sendProposal();
+
+                  return;
+                }
+
+                return closeReject(
                   new Error(
-                    data.error.message ||
-                    "Error de Deriv"
+                    message
                   )
                 );
               }
 
               /*
-                PROPUESTA
+                 PROPUESTA RECIBIDA
               */
 
               if (
@@ -856,7 +1059,7 @@ function executeTrade(
                   )
                 ) {
 
-                  return closeAndReject(
+                  return closeReject(
                     new Error(
                       "Precio de propuesta inválido"
                     )
@@ -868,12 +1071,17 @@ function executeTrade(
                   proposalId
                 );
 
+                console.log(
+                  `DEMO | Duración aceptada: ${selectedDuration} minutos`
+                );
+
                 /*
-                  COMPRA
+                   COMPRAR
                 */
 
                 ws.send(
                   JSON.stringify({
+
                     buy:
                       proposalId,
 
@@ -881,7 +1089,7 @@ function executeTrade(
                       askPrice,
 
                     req_id:
-                      11
+                      200
                   })
                 );
 
@@ -889,7 +1097,7 @@ function executeTrade(
               }
 
               /*
-                COMPRA CONFIRMADA
+                 COMPRA CONFIRMADA
               */
 
               if (
@@ -919,7 +1127,7 @@ function executeTrade(
                     AMOUNT,
 
                   duration:
-                    `${DURATION}m`,
+                    `${selectedDuration}m`,
 
                   contract_id:
                     data.buy
@@ -938,16 +1146,26 @@ function executeTrade(
                 );
 
                 console.log(
-                  JSON.stringify(
-                    lastTrade
-                  )
+                  `DIRECCIÓN: ${direction}`
+                );
+
+                console.log(
+                  `DURACIÓN: ${selectedDuration} minutos`
+                );
+
+                console.log(
+                  `MONTO: $${AMOUNT}`
+                );
+
+                console.log(
+                  `CONTRATO: ${data.buy.contract_id}`
                 );
 
                 console.log(
                   "================================"
                 );
 
-                return closeAndResolve(
+                return closeResolve(
                   lastTrade
                 );
               }
@@ -956,7 +1174,7 @@ function executeTrade(
               error
             ) {
 
-              closeAndReject(
+              closeReject(
                 error
               );
             }
@@ -967,7 +1185,7 @@ function executeTrade(
           "error",
           error => {
 
-            closeAndReject(
+            closeReject(
               error
             );
           }
@@ -986,7 +1204,7 @@ function executeTrade(
 }
 
 /* =========================
-   ANALIZADOR AUTOMÁTICO
+   TRADER AUTOMÁTICO
 ========================= */
 
 async function runAutoTrader() {
@@ -994,12 +1212,14 @@ async function runAutoTrader() {
   if (
     !AUTO_TRADING
   ) {
+
     return;
   }
 
   if (
     autoBusy
   ) {
+
     console.log(
       "AUTO | Ya hay un análisis ejecutándose"
     );
@@ -1007,7 +1227,8 @@ async function runAutoTrader() {
     return;
   }
 
-  autoBusy = true;
+  autoBusy =
+    true;
 
   lastAutoRun =
     new Date()
@@ -1117,12 +1338,15 @@ async function runAutoTrader() {
 }
 
 /* =========================
-   ESTADO DEL BOT
+   ESTADO
 ========================= */
 
 app.get(
   "/",
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
 
@@ -1141,8 +1365,11 @@ app.get(
       amount:
         AMOUNT,
 
-      duration:
-        "5m",
+      duration_mode:
+        "AUTO",
+
+      available_durations:
+        DURATIONS,
 
       auto_trading:
         AUTO_TRADING,
@@ -1197,22 +1424,22 @@ app.get(
       error
     ) {
 
-      res.status(
-        500
-      ).json({
+      res
+        .status(500)
+        .json({
 
-        success:
-          false,
+          success:
+            false,
 
-        error:
-          error.message
-      });
+          error:
+            error.message
+        });
     }
   }
 );
 
 /* =========================
-   OPERACIÓN MANUAL DEMO
+   TRADE MANUAL DEMO
 ========================= */
 
 app.post(
@@ -1231,8 +1458,10 @@ app.post(
         ).toUpperCase();
 
       if (
-        signal !== "CALL" &&
-        signal !== "PUT"
+        signal !==
+          "CALL" &&
+        signal !==
+          "PUT"
       ) {
 
         return res
@@ -1283,7 +1512,7 @@ app.post(
 );
 
 /* =========================
-   INICIO
+   ARRANQUE
 ========================= */
 
 app.listen(
@@ -1315,7 +1544,11 @@ app.listen(
     );
 
     console.log(
-      "Duración: 5 minutos"
+      "Duración: AUTOMÁTICA"
+    );
+
+    console.log(
+      `Duraciones: ${DURATIONS.join(", ")} minutos`
     );
 
     console.log(
@@ -1349,8 +1582,7 @@ app.listen(
       );
 
       /*
-        Primer análisis:
-        5 segundos después
+         Primer análisis
       */
 
       setTimeout(
@@ -1359,13 +1591,14 @@ app.listen(
       );
 
       /*
-        Siguiente análisis:
-        cada 5 minutos
+         Análisis cada 5 minutos
       */
 
       setInterval(
         runAutoTrader,
-        5 * 60 * 1000
+        5 *
+        60 *
+        1000
       );
     }
   }
