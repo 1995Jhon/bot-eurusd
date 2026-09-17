@@ -10,123 +10,64 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const API_BASE = "https://api.derivws.com";
+const PUBLIC_WS = "wss://ws.binaryws.com/websockets/v3";
 
-const DERIV_TOKEN =
-  process.env.DERIV_TOKEN;
-
-const DERIV_APP_ID =
-  process.env.DERIV_APP_ID;
-
-/* =========================
-   CONFIGURACIÓN
-========================= */
+const DERIV_TOKEN = process.env.DERIV_TOKEN;
+const DERIV_APP_ID = process.env.DERIV_APP_ID;
 
 const SYMBOL = "frxEURUSD";
-
 const AMOUNT = 1;
 
-/*
-   El bot intentará estas duraciones
-   automáticamente si una no está disponible.
-*/
-const DURATIONS = [
-  1,
-  2,
-  3,
-  5,
-  10
-];
-
-const DURATION_UNIT = "m";
+// Duraciones en SEGUNDOS.
+// Deriv puede aceptar unas y rechazar otras según el contrato.
+const DURATIONS = [60, 120, 180, 300, 600, 900];
 
 const MAX_TRADES_PER_HOUR = 5;
-
-const AUTO_TRADING =
-  process.env.AUTO_TRADING !== "false";
-
-/* =========================
-   ESTADO
-========================= */
+const AUTO_TRADING = process.env.AUTO_TRADING !== "false";
 
 let tradesThisHour = 0;
-
-let hourStarted =
-  Date.now();
-
-let lastTradeCandle =
-  null;
-
-let lastSignal =
-  "NO_TRADE";
-
-let lastAutoRun =
-  null;
-
-let lastTrade =
-  null;
-
-let autoBusy =
-  false;
+let hourStarted = Date.now();
+let lastTradeCandle = null;
+let autoBusy = false;
+let lastTrade = null;
+let lastSignal = "NO_TRADE";
+let lastAutoRun = null;
 
 /* =========================
-   CONFIGURACIÓN
+   CONFIG
 ========================= */
 
 function checkConfig() {
-
   if (!DERIV_TOKEN) {
-    throw new Error(
-      "Falta DERIV_TOKEN"
-    );
+    throw new Error("Falta DERIV_TOKEN");
   }
 
   if (!DERIV_APP_ID) {
-    throw new Error(
-      "Falta DERIV_APP_ID"
-    );
+    throw new Error("Falta DERIV_APP_ID");
   }
 }
 
 /* =========================
-   CONTADOR HORARIO
+   CONTADOR
 ========================= */
 
 function resetHourlyCounter() {
+  const hour = 60 * 60 * 1000;
 
-  const hour =
-    60 * 60 * 1000;
-
-  if (
-    Date.now() -
-      hourStarted >=
-    hour
-  ) {
-
+  if (Date.now() - hourStarted >= hour) {
     tradesThisHour = 0;
+    hourStarted = Date.now();
 
-    hourStarted =
-      Date.now();
-
-    console.log(
-      "AUTO | Contador horario reiniciado"
-    );
+    console.log("AUTO | Contador horario reiniciado");
   }
 }
 
 /* =========================
-   IDENTIFICADOR DE VELA
+   VELA ACTUAL
 ========================= */
 
 function getCandleId() {
-
-  return Math.floor(
-    Date.now() /
-      (
-        5 *
-        60 *
-        1000
-      )
-  );
+  return Math.floor(Date.now() / (5 * 60 * 1000));
 }
 
 /* =========================
@@ -134,132 +75,182 @@ function getCandleId() {
 ========================= */
 
 async function getDemoAccount() {
-
   checkConfig();
 
-  const response =
-    await fetch(
-      `${API_BASE}/trading/v1/options/accounts`,
-      {
-        method: "GET",
-
-        headers: {
-          Authorization:
-            `Bearer ${DERIV_TOKEN}`,
-
-          "Deriv-App-ID":
-            DERIV_APP_ID,
-
-          Accept:
-            "application/json"
-        }
+  const response = await fetch(
+    `${API_BASE}/trading/v1/options/accounts`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${DERIV_TOKEN}`,
+        "Deriv-App-ID": DERIV_APP_ID,
+        Accept: "application/json"
       }
-    );
+    }
+  );
 
-  const data =
-    await response.json();
+  const data = await response.json();
 
   if (!response.ok) {
-
     throw new Error(
       data?.errors?.[0]?.message ||
       "No se pudieron obtener las cuentas"
     );
   }
 
-  let accounts =
-    data.data || [];
+  let accounts = data.data || [];
 
-  if (
-    !Array.isArray(accounts)
-  ) {
-
-    accounts = [
-      accounts
-    ];
+  if (!Array.isArray(accounts)) {
+    accounts = [accounts];
   }
 
-  const demo =
-    accounts.find(
-      account =>
-        account.account_type ===
-          "demo" &&
-        account.status ===
-          "active"
-    );
-
-  if (
-    !demo?.account_id
-  ) {
-
-    throw new Error(
-      "No se encontró una cuenta DEMO activa"
-    );
-  }
-
-  console.log(
-    "Cuenta DEMO:",
-    demo.account_id
+  const demo = accounts.find(
+    account =>
+      account.account_type === "demo" &&
+      account.status === "active"
   );
+
+  if (!demo?.account_id) {
+    throw new Error("No se encontró una cuenta DEMO activa");
+  }
+
+  console.log("Cuenta DEMO:", demo.account_id);
 
   return demo.account_id;
 }
 
 /* =========================
-   WEBSOCKET AUTENTICADO
+   WEBSOCKET DEMO
 ========================= */
 
-async function getTradingWebSocket(
-  accountId
-) {
-
+async function getTradingWebSocket(accountId) {
   checkConfig();
 
-  const response =
-    await fetch(
-      `${API_BASE}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`,
-      {
-        method: "POST",
-
-        headers: {
-          Authorization:
-            `Bearer ${DERIV_TOKEN}`,
-
-          "Deriv-App-ID":
-            DERIV_APP_ID,
-
-          Accept:
-            "application/json"
-        }
+  const response = await fetch(
+    `${API_BASE}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${DERIV_TOKEN}`,
+        "Deriv-App-ID": DERIV_APP_ID,
+        Accept: "application/json"
       }
-    );
+    }
+  );
 
-  const data =
-    await response.json();
+  const data = await response.json();
 
   if (!response.ok) {
-
     throw new Error(
       data?.errors?.[0]?.message ||
       "No se pudo obtener WebSocket"
     );
   }
 
-  const url =
-    data?.data?.url;
+  const url = data?.data?.url;
 
   if (!url) {
-
-    throw new Error(
-      "Deriv no devolvió URL WebSocket"
-    );
+    throw new Error("Deriv no devolvió URL WebSocket");
   }
 
-  console.log(
-    "WebSocket DEMO obtenido"
-  );
+  console.log("WebSocket DEMO obtenido");
 
   return url;
+}
+
+/* =========================
+   CONTRATOS DISPONIBLES
+========================= */
+
+function getAvailableContracts() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(PUBLIC_WS);
+
+    let finished = false;
+
+    const timeout = setTimeout(() => {
+      finishReject(new Error("Timeout consultando contratos"));
+    }, 15000);
+
+    function finishResolve(value) {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch {}
+
+      resolve(value);
+    }
+
+    function finishReject(error) {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch {}
+
+      reject(error);
+    }
+
+    ws.on("open", () => {
+      console.log("DEMO | Consultando contratos disponibles...");
+
+      ws.send(
+        JSON.stringify({
+          contracts_for: SYMBOL,
+          req_id: 100
+        })
+      );
+    });
+
+    ws.on("message", raw => {
+      try {
+        const data = JSON.parse(raw.toString());
+
+        if (data.error) {
+          return finishReject(
+            new Error(
+              data.error.message ||
+              "Error consultando contratos"
+            )
+          );
+        }
+
+        if (data.msg_type === "contracts_for") {
+          const available =
+            data.contracts_for?.available || [];
+
+          console.log(
+            `DEMO | Contratos disponibles: ${available.length}`
+          );
+
+          const callPut = available.filter(
+            item =>
+              item.contract_type === "CALL" ||
+              item.contract_type === "PUT"
+          );
+
+          console.log(
+            `DEMO | CALL/PUT disponibles: ${callPut.length}`
+          );
+
+          finishResolve(callPut);
+        }
+      } catch (error) {
+        finishReject(error);
+      }
+    });
+
+    ws.on("error", error => {
+      finishReject(error);
+    });
+  });
 }
 
 /* =========================
@@ -267,270 +258,129 @@ async function getTradingWebSocket(
 ========================= */
 
 function getCandles() {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(PUBLIC_WS);
 
-  return new Promise(
-    (resolve, reject) => {
+    let finished = false;
 
-      const ws =
-        new WebSocket(
-          `${API_BASE}/trading/v1/options/ws/public`
-        );
+    const timeout = setTimeout(() => {
+      finishReject(new Error("Timeout obteniendo EUR/USD"));
+    }, 15000);
 
-      let finished =
-        false;
+    function finishResolve(value) {
+      if (finished) return;
 
-      const timeout =
-        setTimeout(
-          () => {
+      finished = true;
+      clearTimeout(timeout);
 
-            finish(
-              reject,
-              new Error(
-                "Timeout obteniendo EUR/USD"
-              )
+      try {
+        ws.close();
+      } catch {}
+
+      resolve(value);
+    }
+
+    function finishReject(error) {
+      if (finished) return;
+
+      finished = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch {}
+
+      reject(error);
+    }
+
+    ws.on("open", () => {
+      console.log("Mercado EUR/USD conectado");
+
+      ws.send(
+        JSON.stringify({
+          ticks_history: SYMBOL,
+          end: "latest",
+          count: 100,
+          style: "candles",
+          granularity: 300,
+          req_id: 1
+        })
+      );
+    });
+
+    ws.on("message", raw => {
+      try {
+        const data = JSON.parse(raw.toString());
+
+        if (data.error) {
+          return finishReject(
+            new Error(
+              data.error.message ||
+              "Error de mercado"
+            )
+          );
+        }
+
+        if (
+          data.msg_type === "candles" &&
+          Array.isArray(data.candles)
+        ) {
+          const candles = data.candles
+            .map(candle => ({
+              open: Number(candle.open),
+              high: Number(candle.high),
+              low: Number(candle.low),
+              close: Number(candle.close),
+              epoch: Number(candle.epoch)
+            }))
+            .filter(candle =>
+              Number.isFinite(candle.close)
             );
 
-          },
-          15000
-        );
-
-      function finish(
-        callback,
-        value
-      ) {
-
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-
-        clearTimeout(
-          timeout
-        );
-
-        try {
-          ws.close();
-        } catch {}
-
-        callback(
-          value
-        );
-      }
-
-      ws.on(
-        "open",
-        () => {
-
-          console.log(
-            "Mercado EUR/USD conectado"
-          );
-
-          /*
-             IMPORTANTE:
-             No usamos subscribe.
-             Solo pedimos historial.
-          */
-
-          ws.send(
-            JSON.stringify({
-
-              ticks_history:
-                SYMBOL,
-
-              end:
-                "latest",
-
-              count:
-                100,
-
-              style:
-                "candles",
-
-              granularity:
-                300,
-
-              req_id:
-                1
-            })
-          );
-        }
-      );
-
-      ws.on(
-        "message",
-        raw => {
-
-          try {
-
-            const data =
-              JSON.parse(
-                raw.toString()
-              );
-
-            if (
-              data.error
-            ) {
-
-              return finish(
-                reject,
-                new Error(
-                  data.error.message ||
-                  "Error de mercado"
-                )
-              );
-            }
-
-            if (
-              data.msg_type ===
-                "candles" &&
-              Array.isArray(
-                data.candles
-              )
-            ) {
-
-              const candles =
-                data.candles
-                  .map(
-                    candle => ({
-
-                      open:
-                        Number(
-                          candle.open
-                        ),
-
-                      high:
-                        Number(
-                          candle.high
-                        ),
-
-                      low:
-                        Number(
-                          candle.low
-                        ),
-
-                      close:
-                        Number(
-                          candle.close
-                        ),
-
-                      epoch:
-                        Number(
-                          candle.epoch
-                        )
-                    })
-                  )
-                  .filter(
-                    candle =>
-                      Number.isFinite(
-                        candle.close
-                      )
-                  );
-
-              if (
-                candles.length <
-                30
-              ) {
-
-                return finish(
-                  reject,
-                  new Error(
-                    "No hay suficientes velas"
-                  )
-                );
-              }
-
-              console.log(
-                `Mercado | ${candles.length} velas recibidas`
-              );
-
-              return finish(
-                resolve,
-                candles
-              );
-            }
-
-          } catch (
-            error
-          ) {
-
-            finish(
-              reject,
-              error
+          if (candles.length < 30) {
+            return finishReject(
+              new Error("No hay suficientes velas")
             );
           }
-        }
-      );
 
-      ws.on(
-        "error",
-        error => {
-
-          finish(
-            reject,
-            error
+          console.log(
+            `Mercado | ${candles.length} velas recibidas`
           );
+
+          finishResolve(candles);
         }
-      );
-    }
-  );
+      } catch (error) {
+        finishReject(error);
+      }
+    });
+
+    ws.on("error", error => {
+      finishReject(error);
+    });
+  });
 }
 
 /* =========================
    EMA
 ========================= */
 
-function ema(
-  values,
-  period
-) {
-
-  if (
-    values.length <
-    period
-  ) {
-
+function ema(values, period) {
+  if (values.length < period) {
     return null;
   }
 
-  const multiplier =
-    2 /
-    (
-      period +
-      1
-    );
+  const multiplier = 2 / (period + 1);
 
   let result =
     values
-      .slice(
-        0,
-        period
-      )
-      .reduce(
-        (
-          sum,
-          value
-        ) =>
-          sum +
-          value,
-        0
-      ) /
+      .slice(0, period)
+      .reduce((sum, value) => sum + value, 0) /
     period;
 
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-
+  for (let i = period; i < values.length; i++) {
     result =
-      values[i] *
-        multiplier +
-      result *
-        (
-          1 -
-          multiplier
-        );
+      values[i] * multiplier +
+      result * (1 - multiplier);
   }
 
   return result;
@@ -540,168 +390,81 @@ function ema(
    RSI
 ========================= */
 
-function rsi(
-  values,
-  period = 14
-) {
-
-  if (
-    values.length <=
-    period
-  ) {
-
+function rsi(values, period = 14) {
+  if (values.length <= period) {
     return null;
   }
 
   let gains = 0;
-
   let losses = 0;
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
+  for (let i = 1; i <= period; i++) {
+    const change = values[i] - values[i - 1];
 
-    const change =
-      values[i] -
-      values[i - 1];
-
-    if (
-      change >= 0
-    ) {
-
-      gains +=
-        change;
-
+    if (change >= 0) {
+      gains += change;
     } else {
-
-      losses +=
-        Math.abs(
-          change
-        );
+      losses += Math.abs(change);
     }
   }
 
-  let averageGain =
-    gains /
-    period;
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
 
-  let averageLoss =
-    losses /
-    period;
+  for (let i = period + 1; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
 
-  for (
-    let i =
-      period + 1;
-    i < values.length;
-    i++
-  ) {
-
-    const change =
-      values[i] -
-      values[i - 1];
-
-    const gain =
-      Math.max(
-        change,
-        0
-      );
-
-    const loss =
-      Math.max(
-        -change,
-        0
-      );
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
 
     averageGain =
-      (
-        averageGain *
-          (
-            period -
-            1
-          ) +
-        gain
-      ) /
+      (averageGain * (period - 1) + gain) /
       period;
 
     averageLoss =
-      (
-        averageLoss *
-          (
-            period -
-            1
-          ) +
-        loss
-      ) /
+      (averageLoss * (period - 1) + loss) /
       period;
   }
 
-  if (
-    averageLoss ===
-    0
-  ) {
-
+  if (averageLoss === 0) {
     return 100;
   }
 
-  const rs =
-    averageGain /
-    averageLoss;
+  const rs = averageGain / averageLoss;
 
-  return (
-    100 -
-    100 /
-      (
-        1 +
-        rs
-      )
-  );
+  return 100 - 100 / (1 + rs);
 }
 
 /* =========================
    SEÑAL
 ========================= */
 
-function getSignal(
-  candles
-) {
+function getSignal(candles) {
+  const closes = candles.map(candle => candle.close);
 
-  const closes =
-    candles.map(
-      candle =>
-        candle.close
-    );
-
-  const ema9 =
-    ema(
-      closes,
-      9
-    );
-
-  const ema21 =
-    ema(
-      closes,
-      21
-    );
+  const ema9 = ema(closes, 9);
+  const ema21 = ema(closes, 21);
 
   const current =
-    closes[
-      closes.length -
-      1
-    ];
+    closes[closes.length - 1];
 
   const previous =
-    closes[
-      closes.length -
-      2
-    ];
+    closes[closes.length - 2];
 
   const currentRsi =
-    rsi(
-      closes,
-      14
-    );
+    rsi(closes, 14);
+
+  console.log(
+    `AUTO | EMA9=${ema9?.toFixed(6)}`
+  );
+
+  console.log(
+    `AUTO | EMA21=${ema21?.toFixed(6)}`
+  );
+
+  console.log(
+    `AUTO | RSI14=${currentRsi?.toFixed(2)}`
+  );
 
   if (
     ![
@@ -710,47 +473,26 @@ function getSignal(
       current,
       previous,
       currentRsi
-    ].every(
-      Number.isFinite
-    )
+    ].every(Number.isFinite)
   ) {
-
     return null;
   }
 
-  /*
-     CALL
-  */
-
   if (
-    ema9 >
-      ema21 &&
-    currentRsi >=
-      50 &&
-    currentRsi <=
-      70 &&
-    current >
-      previous
+    ema9 > ema21 &&
+    currentRsi >= 50 &&
+    currentRsi <= 70 &&
+    current > previous
   ) {
-
     return "CALL";
   }
 
-  /*
-     PUT
-  */
-
   if (
-    ema9 <
-      ema21 &&
-    currentRsi >=
-      30 &&
-    currentRsi <=
-      50 &&
-    current <
-      previous
+    ema9 < ema21 &&
+    currentRsi >= 30 &&
+    currentRsi <= 50 &&
+    current < previous
   ) {
-
     return "PUT";
   }
 
@@ -758,483 +500,317 @@ function getSignal(
 }
 
 /* =========================
-   EJECUTAR TRADE
+   PROPUESTA + COMPRA DEMO
 ========================= */
 
-function executeTrade(
-  direction
-) {
-
-  return new Promise(
-    async (
-      resolve,
-      reject
-    ) => {
-
-      let ws = null;
-
-      try {
-
-        checkConfig();
-
-        resetHourlyCounter();
-
-        if (
-          tradesThisHour >=
-          MAX_TRADES_PER_HOUR
-        ) {
-
-          throw new Error(
-            "Límite de 5 operaciones por hora"
-          );
-        }
-
-        const currentCandle =
-          getCandleId();
-
-        if (
-          lastTradeCandle ===
-          currentCandle
-        ) {
-
-          throw new Error(
-            "Ya hubo una operación en esta vela"
-          );
-        }
-
-        const accountId =
-          await getDemoAccount();
-
-        const wsUrl =
-          await getTradingWebSocket(
-            accountId
-          );
-
-        ws =
-          new WebSocket(
-            wsUrl
-          );
-
-        let finished =
-          false;
-
-        let durationIndex =
-          0;
-
-        let selectedDuration =
-          null;
-
-        const timeout =
-          setTimeout(
-            () => {
-
-              if (
-                finished
-              ) {
-                return;
-              }
-
-              finished =
-                true;
-
-              try {
-                ws.close();
-              } catch {}
-
-              reject(
-                new Error(
-                  "Timeout con Deriv"
-                )
-              );
-
-            },
-            30000
-          );
-
-        function closeResolve(
-          result
-        ) {
-
-          if (
-            finished
-          ) {
-            return;
-          }
-
-          finished =
-            true;
-
-          clearTimeout(
-            timeout
-          );
-
-          try {
-            ws.close();
-          } catch {}
-
-          resolve(
-            result
-          );
-        }
-
-        function closeReject(
-          error
-        ) {
-
-          if (
-            finished
-          ) {
-            return;
-          }
-
-          finished =
-            true;
-
-          clearTimeout(
-            timeout
-          );
-
-          try {
-            ws.close();
-          } catch {}
-
-          reject(
-            error
-          );
-        }
-
-        function sendProposal() {
-
-          if (
-            durationIndex >=
-            DURATIONS.length
-          ) {
-
-            return closeReject(
-              new Error(
-                "No hay una duración disponible para este contrato en este momento"
-              )
-            );
-          }
-
-          selectedDuration =
-            DURATIONS[
-              durationIndex
-            ];
-
-          console.log(
-            `DEMO | Probando duración ${selectedDuration} minutos`
-          );
-
-          ws.send(
-            JSON.stringify({
-
-              proposal:
-                1,
-
-              amount:
-                AMOUNT,
-
-              basis:
-                "stake",
-
-              contract_type:
-                direction,
-
-              currency:
-                "USD",
-
-              duration:
-                selectedDuration,
-
-              duration_unit:
-                DURATION_UNIT,
-
-              underlying_symbol:
-                SYMBOL,
-
-              req_id:
-                100 +
-                durationIndex
-            })
-          );
-        }
-
-        ws.on(
-          "open",
-          () => {
-
-            console.log(
-              `DEMO | WebSocket conectado | ${direction}`
-            );
-
-            sendProposal();
-          }
-        );
-
-        ws.on(
-          "message",
-          raw => {
-
-            try {
-
-              const data =
-                JSON.parse(
-                  raw.toString()
-                );
-
-              /*
-                 ERROR DE DERIV
-              */
-
-              if (
-                data.error
-              ) {
-
-                const message =
-                  data.error.message ||
-                  "Error de Deriv";
-
-                console.error(
-                  "DEMO | Error:",
-                  message
-                );
-
-                /*
-                   Si la duración no está disponible,
-                   probamos automáticamente la siguiente.
-                */
-
-                if (
-                  message
-                    .toLowerCase()
-                    .includes(
-                      "not offered for this duration"
-                    )
-                ) {
-
-                  durationIndex++;
-
-                  console.log(
-                    `DEMO | Duración ${selectedDuration} no disponible`
-                  );
-
-                  console.log(
-                    "DEMO | Probando siguiente duración..."
-                  );
-
-                  sendProposal();
-
-                  return;
-                }
-
-                return closeReject(
-                  new Error(
-                    message
-                  )
-                );
-              }
-
-              /*
-                 PROPUESTA RECIBIDA
-              */
-
-              if (
-                data.msg_type ===
-                  "proposal" &&
-                data.proposal?.id
-              ) {
-
-                const proposalId =
-                  data.proposal.id;
-
-                const askPrice =
-                  Number(
-                    data.proposal.ask_price
-                  );
-
-                if (
-                  !Number.isFinite(
-                    askPrice
-                  )
-                ) {
-
-                  return closeReject(
-                    new Error(
-                      "Precio de propuesta inválido"
-                    )
-                  );
-                }
-
-                console.log(
-                  "DEMO | Propuesta recibida:",
-                  proposalId
-                );
-
-                console.log(
-                  `DEMO | Duración aceptada: ${selectedDuration} minutos`
-                );
-
-                /*
-                   COMPRAR
-                */
-
-                ws.send(
-                  JSON.stringify({
-
-                    buy:
-                      proposalId,
-
-                    price:
-                      askPrice,
-
-                    req_id:
-                      200
-                  })
-                );
-
-                return;
-              }
-
-              /*
-                 COMPRA CONFIRMADA
-              */
-
-              if (
-                data.msg_type ===
-                  "buy" &&
-                data.buy
-              ) {
-
-                tradesThisHour++;
-
-                lastTradeCandle =
-                  currentCandle;
-
-                lastTrade = {
-
-                  time:
-                    new Date()
-                      .toISOString(),
-
-                  mode:
-                    "DEMO",
-
-                  direction:
-                    direction,
-
-                  amount:
-                    AMOUNT,
-
-                  duration:
-                    `${selectedDuration}m`,
-
-                  contract_id:
-                    data.buy
-                      .contract_id,
-
-                  account_id:
-                    accountId
-                };
-
-                console.log(
-                  "================================"
-                );
-
-                console.log(
-                  "OPERACIÓN DEMO CONFIRMADA"
-                );
-
-                console.log(
-                  `DIRECCIÓN: ${direction}`
-                );
-
-                console.log(
-                  `DURACIÓN: ${selectedDuration} minutos`
-                );
-
-                console.log(
-                  `MONTO: $${AMOUNT}`
-                );
-
-                console.log(
-                  `CONTRATO: ${data.buy.contract_id}`
-                );
-
-                console.log(
-                  "================================"
-                );
-
-                return closeResolve(
-                  lastTrade
-                );
-              }
-
-            } catch (
-              error
-            ) {
-
-              closeReject(
-                error
-              );
-            }
-          }
-        );
-
-        ws.on(
-          "error",
-          error => {
-
-            closeReject(
-              error
-            );
-          }
-        );
-
-      } catch (
-        error
-      ) {
-
-        reject(
-          error
+function executeTrade(direction) {
+  return new Promise(async (resolve, reject) => {
+    let ws = null;
+
+    try {
+      checkConfig();
+      resetHourlyCounter();
+
+      if (tradesThisHour >= MAX_TRADES_PER_HOUR) {
+        throw new Error(
+          "Límite de 5 operaciones por hora"
         );
       }
+
+      const currentCandle = getCandleId();
+
+      if (lastTradeCandle === currentCandle) {
+        throw new Error(
+          "Ya hubo una operación en esta vela"
+        );
+      }
+
+      // Primero comprobamos que CALL/PUT exista.
+      const contracts =
+        await getAvailableContracts();
+
+      const directionAvailable =
+        contracts.some(
+          contract =>
+            contract.contract_type === direction
+        );
+
+      if (!directionAvailable) {
+        throw new Error(
+          `${direction} no está disponible para ${SYMBOL} en este momento`
+        );
+      }
+
+      const accountId =
+        await getDemoAccount();
+
+      const wsUrl =
+        await getTradingWebSocket(accountId);
+
+      ws = new WebSocket(wsUrl);
+
+      let finished = false;
+      let durationIndex = 0;
+
+      const timeout = setTimeout(() => {
+        if (finished) return;
+
+        finished = true;
+
+        try {
+          ws.close();
+        } catch {}
+
+        reject(
+          new Error("Timeout con Deriv")
+        );
+      }, 40000);
+
+      function finishResolve(result) {
+        if (finished) return;
+
+        finished = true;
+        clearTimeout(timeout);
+
+        try {
+          ws.close();
+        } catch {}
+
+        resolve(result);
+      }
+
+      function finishReject(error) {
+        if (finished) return;
+
+        finished = true;
+        clearTimeout(timeout);
+
+        try {
+          ws.close();
+        } catch {}
+
+        reject(error);
+      }
+
+      function sendProposal() {
+        if (durationIndex >= DURATIONS.length) {
+          return finishReject(
+            new Error(
+              "No hay una duración disponible para este contrato en este momento"
+            )
+          );
+        }
+
+        const duration =
+          DURATIONS[durationIndex];
+
+        console.log(
+          `DEMO | Probando ${duration} segundos`
+        );
+
+        ws.send(
+          JSON.stringify({
+            proposal: 1,
+            amount: AMOUNT,
+            basis: "stake",
+            contract_type: direction,
+            currency: "USD",
+            duration: duration,
+            duration_unit: "s",
+            underlying_symbol: SYMBOL,
+            subscribe: 1,
+            req_id: 200 + durationIndex
+          })
+        );
+      }
+
+      ws.on("open", () => {
+        console.log(
+          `DEMO | WebSocket conectado | ${direction}`
+        );
+
+        sendProposal();
+      });
+
+      ws.on("message", raw => {
+        try {
+          const data =
+            JSON.parse(raw.toString());
+
+          if (data.error) {
+            const message =
+              data.error.message ||
+              "Error de Deriv";
+
+            console.log(
+              `DEMO | Error: ${message}`
+            );
+
+            if (
+              message
+                .toLowerCase()
+                .includes("not offered") ||
+              message
+                .toLowerCase()
+                .includes("duration") ||
+              message
+                .toLowerCase()
+                .includes("not available")
+            ) {
+              console.log(
+                `DEMO | Duración ${DURATIONS[durationIndex]} no disponible`
+              );
+
+              durationIndex++;
+
+              console.log(
+                "DEMO | Probando siguiente duración..."
+              );
+
+              return sendProposal();
+            }
+
+            return finishReject(
+              new Error(message)
+            );
+          }
+
+          if (
+            data.msg_type === "proposal" &&
+            data.proposal?.id
+          ) {
+            const proposalId =
+              data.proposal.id;
+
+            const askPrice =
+              Number(
+                data.proposal.ask_price
+              );
+
+            const duration =
+              DURATIONS[durationIndex];
+
+            console.log(
+              `DEMO | PROPUESTA ACEPTADA`
+            );
+
+            console.log(
+              `DEMO | Duración válida: ${duration} segundos`
+            );
+
+            console.log(
+              `DEMO | Precio: $${askPrice}`
+            );
+
+            ws.send(
+              JSON.stringify({
+                buy: proposalId,
+                price: AMOUNT,
+                req_id: 500
+              })
+            );
+
+            return;
+          }
+
+          if (
+            data.msg_type === "buy" &&
+            data.buy?.contract_id
+          ) {
+            const contractId =
+              data.buy.contract_id;
+
+            tradesThisHour++;
+            lastTradeCandle =
+              getCandleId();
+
+            lastTrade = {
+              time: new Date().toISOString(),
+              direction,
+              amount: AMOUNT,
+              duration:
+                DURATIONS[durationIndex],
+              duration_unit: "s",
+              contract_id: contractId,
+              account: accountId,
+              status: "DEMO_CONFIRMED"
+            };
+
+            console.log(
+              "================================"
+            );
+
+            console.log(
+              "OPERACIÓN DEMO CONFIRMADA"
+            );
+
+            console.log(
+              `DEMO | Dirección: ${direction}`
+            );
+
+            console.log(
+              `DEMO | Monto: $${AMOUNT}`
+            );
+
+            console.log(
+              `DEMO | Duración: ${DURATIONS[durationIndex]} segundos`
+            );
+
+            console.log(
+              `DEMO | Contract ID: ${contractId}`
+            );
+
+            console.log(
+              `DEMO | Operaciones esta hora: ${tradesThisHour}/${MAX_TRADES_PER_HOUR}`
+            );
+
+            console.log(
+              "================================"
+            );
+
+            return finishResolve(
+              lastTrade
+            );
+          }
+        } catch (error) {
+          finishReject(error);
+        }
+      });
+
+      ws.on("error", error => {
+        finishReject(error);
+      });
+
+    } catch (error) {
+      reject(error);
     }
-  );
+  });
 }
 
 /* =========================
-   TRADER AUTOMÁTICO
+   ANALIZADOR AUTOMÁTICO
 ========================= */
 
 async function runAutoTrader() {
-
-  if (
-    !AUTO_TRADING
-  ) {
-
-    return;
-  }
-
-  if (
-    autoBusy
-  ) {
-
+  if (!AUTO_TRADING) {
     console.log(
-      "AUTO | Ya hay un análisis ejecutándose"
+      "AUTO | Trading automático desactivado"
     );
-
     return;
   }
 
-  autoBusy =
-    true;
+  if (autoBusy) {
+    console.log(
+      "AUTO | Análisis anterior todavía activo"
+    );
+    return;
+  }
 
-  lastAutoRun =
-    new Date()
-      .toISOString();
+  autoBusy = true;
+  lastAutoRun = new Date().toISOString();
 
   try {
+    resetHourlyCounter();
 
     console.log(
       "================================"
@@ -1244,64 +820,31 @@ async function runAutoTrader() {
       "AUTO | Analizando EUR/USD..."
     );
 
-    resetHourlyCounter();
+    if (
+      tradesThisHour >=
+      MAX_TRADES_PER_HOUR
+    ) {
+      console.log(
+        "AUTO | Límite horario alcanzado"
+      );
+
+      return;
+    }
 
     const candles =
       await getCandles();
 
-    const closes =
-      candles.map(
-        candle =>
-          candle.close
-      );
-
-    const ema9 =
-      ema(
-        closes,
-        9
-      );
-
-    const ema21 =
-      ema(
-        closes,
-        21
-      );
-
-    const currentRsi =
-      rsi(
-        closes,
-        14
-      );
-
     const signal =
-      getSignal(
-        candles
-      );
+      getSignal(candles);
 
     lastSignal =
-      signal ||
-      "NO_TRADE";
-
-    console.log(
-      `AUTO | EMA9=${ema9?.toFixed(6)}`
-    );
-
-    console.log(
-      `AUTO | EMA21=${ema21?.toFixed(6)}`
-    );
-
-    console.log(
-      `AUTO | RSI14=${currentRsi?.toFixed(2)}`
-    );
+      signal || "NO_TRADE";
 
     console.log(
       `AUTO | SEÑAL=${lastSignal}`
     );
 
-    if (
-      !signal
-    ) {
-
+    if (!signal) {
       console.log(
         "AUTO | Sin operación"
       );
@@ -1314,292 +857,159 @@ async function runAutoTrader() {
     );
 
     console.log(
-      `AUTO | Ejecutando DEMO $${AMOUNT}`
+      "AUTO | Ejecutando DEMO $1"
     );
 
-    await executeTrade(
-      signal
+    await executeTrade(signal);
+
+  } catch (error) {
+    console.log(
+      `AUTO | ERROR: ${error.message}`
     );
-
-  } catch (
-    error
-  ) {
-
-    console.error(
-      "AUTO | ERROR:",
-      error.message
-    );
-
   } finally {
+    autoBusy = false;
 
-    autoBusy =
-      false;
+    console.log(
+      "================================"
+    );
   }
 }
 
 /* =========================
-   ESTADO
+   WEB
 ========================= */
 
-app.get(
-  "/",
-  (
-    req,
-    res
-  ) => {
+app.get("/", (req, res) => {
+  res.json({
+    bot: "EUR/USD DEMO",
+    status: "running",
+    symbol: SYMBOL,
+    amount: AMOUNT,
+    mode: "DEMO",
+    auto_trading: AUTO_TRADING,
+    durations_seconds: DURATIONS,
+    max_trades_per_hour: MAX_TRADES_PER_HOUR,
+    last_signal: lastSignal,
+    last_auto_run: lastAutoRun,
+    last_trade: lastTrade
+  });
+});
+
+app.get("/account-test", async (req, res) => {
+  try {
+    const account =
+      await getDemoAccount();
 
     res.json({
-
-      bot:
-        "EUR/USD Auto Trader",
-
-      status:
-        "online",
-
-      mode:
-        "DEMO",
-
-      symbol:
-        SYMBOL,
-
-      amount:
-        AMOUNT,
-
-      duration_mode:
-        "AUTO",
-
-      available_durations:
-        DURATIONS,
-
-      auto_trading:
-        AUTO_TRADING,
-
-      trades_this_hour:
-        tradesThisHour,
-
-      max_trades_per_hour:
-        MAX_TRADES_PER_HOUR,
-
-      last_signal:
-        lastSignal,
-
-      last_auto_run:
-        lastAutoRun,
-
-      last_trade:
-        lastTrade
+      ok: true,
+      mode: "DEMO",
+      account
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
     });
   }
-);
+});
 
-/* =========================
-   PRUEBA DE CUENTA
-========================= */
-
-app.get(
-  "/account-test",
-  async (
-    req,
-    res
-  ) => {
-
-    try {
-
-      const account =
-        await getDemoAccount();
-
-      res.json({
-
-        success:
-          true,
-
-        mode:
-          "DEMO",
-
-        account_id:
-          account
-      });
-
-    } catch (
-      error
-    ) {
-
-      res
-        .status(500)
-        .json({
-
-          success:
-            false,
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =========================
-   TRADE MANUAL DEMO
-========================= */
-
-app.post(
-  "/trade",
-  async (
-    req,
-    res
-  ) => {
-
-    try {
-
-      const signal =
-        String(
-          req.body.signal ||
-          ""
-        ).toUpperCase();
-
-      if (
-        signal !==
-          "CALL" &&
-        signal !==
-          "PUT"
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            success:
-              false,
-
-            error:
-              "Usa CALL o PUT"
-          });
-      }
-
-      const result =
-        await executeTrade(
-          signal
-        );
-
-      res.json({
-
-        success:
-          true,
-
-        mode:
-          "DEMO",
-
-        result:
-          result
-      });
-
-    } catch (
-      error
-    ) {
-
-      res
-        .status(500)
-        .json({
-
-          success:
-            false,
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =========================
-   ARRANQUE
-========================= */
-
-app.listen(
-  PORT,
-  () => {
-
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      "BOT EUR/USD INICIADO"
-    );
-
-    console.log(
-      `Puerto: ${PORT}`
-    );
-
-    console.log(
-      "MODO: DEMO"
-    );
-
-    console.log(
-      `Símbolo: ${SYMBOL}`
-    );
-
-    console.log(
-      `Monto: $${AMOUNT}`
-    );
-
-    console.log(
-      "Duración: AUTOMÁTICA"
-    );
-
-    console.log(
-      `Duraciones: ${DURATIONS.join(", ")} minutos`
-    );
-
-    console.log(
-      `Auto trading: ${AUTO_TRADING}`
-    );
-
-    console.log(
-      "DERIV TOKEN:",
-      Boolean(
-        DERIV_TOKEN
-      )
-    );
-
-    console.log(
-      "DERIV APP ID:",
-      Boolean(
-        DERIV_APP_ID
-      )
-    );
-
-    console.log(
-      "================================"
-    );
+app.post("/trade", async (req, res) => {
+  try {
+    const direction =
+      String(
+        req.body?.direction || ""
+      ).toUpperCase();
 
     if (
-      AUTO_TRADING
+      direction !== "CALL" &&
+      direction !== "PUT"
     ) {
-
-      console.log(
-        "AUTO | Monitor iniciado"
-      );
-
-      /*
-         Primer análisis
-      */
-
-      setTimeout(
-        runAutoTrader,
-        5000
-      );
-
-      /*
-         Análisis cada 5 minutos
-      */
-
-      setInterval(
-        runAutoTrader,
-        5 *
-        60 *
-        1000
-      );
+      return res.status(400).json({
+        ok: false,
+        error:
+          "direction debe ser CALL o PUT"
+      });
     }
+
+    const result =
+      await executeTrade(direction);
+
+    res.json({
+      ok: true,
+      result
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
   }
-);
+});
+
+/* =========================
+   INICIO
+========================= */
+
+app.listen(PORT, () => {
+  console.log(
+    "================================"
+  );
+
+  console.log(
+    "BOT EUR/USD INICIADO"
+  );
+
+  console.log(
+    `Puerto: ${PORT}`
+  );
+
+  console.log(
+    "Modo: DEMO"
+  );
+
+  console.log(
+    `Símbolo: ${SYMBOL}`
+  );
+
+  console.log(
+    `Monto: $${AMOUNT}`
+  );
+
+  console.log(
+    "Duración: AUTOMÁTICA"
+  );
+
+  console.log(
+    `Duraciones: ${DURATIONS.join(", ")} segundos`
+  );
+
+  console.log(
+    `Máximo: ${MAX_TRADES_PER_HOUR} operaciones/hora`
+  );
+
+  console.log(
+    `DERIV_TOKEN configurado: ${Boolean(DERIV_TOKEN)}`
+  );
+
+  console.log(
+    `DERIV_APP_ID configurado: ${Boolean(DERIV_APP_ID)}`
+  );
+
+  console.log(
+    "================================"
+  );
+
+  if (AUTO_TRADING) {
+    console.log(
+      "AUTO | Monitor iniciado"
+    );
+
+    runAutoTrader();
+
+    setInterval(
+      runAutoTrader,
+      5 * 60 * 1000
+    );
+  }
+});
