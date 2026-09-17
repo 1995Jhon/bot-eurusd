@@ -1,3 +1,4 @@
+
 const express = require("express");
 const cors = require("cors");
 const WebSocket = require("ws");
@@ -17,9 +18,6 @@ const API_BASE = "https://api.derivws.com";
 
 const DERIV_TOKEN = process.env.DERIV_TOKEN;
 const DERIV_APP_ID = process.env.DERIV_APP_ID;
-
-// Opcional.
-// Si está vacío, el bot buscará automáticamente la cuenta DEMO.
 const DERIV_ACCOUNT_ID = process.env.DERIV_ACCOUNT_ID || "";
 
 const SYMBOL = "frxEURUSD";
@@ -56,7 +54,7 @@ function checkConfig() {
 }
 
 // =====================================================
-// REINICIAR CONTADOR CADA HORA
+// REINICIAR CONTADOR
 // =====================================================
 
 function resetHourlyCounter() {
@@ -66,7 +64,6 @@ function resetHourlyCounter() {
     if (now - hourStarted >= 60 * 60 * 1000) {
 
         tradesThisHour = 0;
-
         hourStarted = now;
     }
 }
@@ -83,7 +80,7 @@ function getFiveMinuteCandle() {
 }
 
 // =====================================================
-// OBTENER CUENTA OPTIONS DEMO AUTOMÁTICAMENTE
+// BUSCAR CUENTA DEMO
 // =====================================================
 
 async function getDemoAccountId() {
@@ -117,7 +114,6 @@ async function getDemoAccountId() {
 
     let accounts = data?.data || [];
 
-    // La API puede devolver un objeto o un array.
     if (!Array.isArray(accounts)) {
         accounts = [accounts];
     }
@@ -150,7 +146,6 @@ async function getDemoAccountId() {
 async function getAccountId() {
 
     if (DERIV_ACCOUNT_ID) {
-
         return DERIV_ACCOUNT_ID;
     }
 
@@ -158,7 +153,7 @@ async function getAccountId() {
 }
 
 // =====================================================
-// OBTENER WEBSOCKET AUTENTICADO
+// OBTENER WEBSOCKET
 // =====================================================
 
 async function getWebSocketUrl(accountId) {
@@ -218,10 +213,6 @@ function executeTrade(direction) {
 
             checkConfig();
 
-            // -----------------------------------------
-            // VALIDAR SEÑAL
-            // -----------------------------------------
-
             if (
                 direction !== "CALL" &&
                 direction !== "PUT"
@@ -233,10 +224,6 @@ function executeTrade(direction) {
                     )
                 );
             }
-
-            // -----------------------------------------
-            // CONTROL HORARIO
-            // -----------------------------------------
 
             resetHourlyCounter();
 
@@ -252,10 +239,6 @@ function executeTrade(direction) {
                 );
             }
 
-            // -----------------------------------------
-            // UNA OPERACIÓN POR VELA
-            // -----------------------------------------
-
             const candle =
                 getFiveMinuteCandle();
 
@@ -268,10 +251,6 @@ function executeTrade(direction) {
                 );
             }
 
-            // -----------------------------------------
-            // CUENTA DEMO
-            // -----------------------------------------
-
             const accountId =
                 await getAccountId();
 
@@ -279,10 +258,6 @@ function executeTrade(direction) {
                 "Cuenta utilizada:",
                 accountId
             );
-
-            // -----------------------------------------
-            // WEBSOCKET
-            // -----------------------------------------
 
             const wsUrl =
                 await getWebSocketUrl(
@@ -313,18 +288,10 @@ function executeTrade(direction) {
 
                 }, 15000);
 
-            // -----------------------------------------
-            // CONEXIÓN
-            // -----------------------------------------
-
             ws.on("open", () => {
 
                 console.log(
                     "WebSocket conectado"
-                );
-
-                console.log(
-                    `Solicitando propuesta ${direction}`
                 );
 
                 ws.send(
@@ -354,10 +321,6 @@ function executeTrade(direction) {
                 );
             });
 
-            // -----------------------------------------
-            // MENSAJES
-            // -----------------------------------------
-
             ws.on("message", (raw) => {
 
                 try {
@@ -371,10 +334,6 @@ function executeTrade(direction) {
                         "Deriv:",
                         JSON.stringify(data)
                     );
-
-                    // ---------------------------------
-                    // ERROR
-                    // ---------------------------------
 
                     if (data.error) {
 
@@ -400,10 +359,6 @@ function executeTrade(direction) {
 
                         return;
                     }
-
-                    // ---------------------------------
-                    // PROPUESTA
-                    // ---------------------------------
 
                     if (
                         data.msg_type ===
@@ -448,15 +403,6 @@ function executeTrade(direction) {
                             return;
                         }
 
-                        console.log(
-                            "Propuesta recibida:",
-                            proposalId
-                        );
-
-                        // ---------------------------------
-                        // COMPRAR
-                        // ---------------------------------
-
                         ws.send(
                             JSON.stringify({
 
@@ -472,10 +418,6 @@ function executeTrade(direction) {
 
                         return;
                     }
-
-                    // ---------------------------------
-                    // COMPRA CONFIRMADA
-                    // ---------------------------------
 
                     if (
                         data.msg_type === "buy" &&
@@ -508,7 +450,8 @@ function executeTrade(direction) {
 
                                 mode: "DEMO",
 
-                                symbol: SYMBOL,
+                                symbol:
+                                    SYMBOL,
 
                                 direction:
                                     direction,
@@ -550,10 +493,6 @@ function executeTrade(direction) {
                 }
             });
 
-            // -----------------------------------------
-            // ERROR WEBSOCKET
-            // -----------------------------------------
-
             ws.on("error", (error) => {
 
                 if (!finished) {
@@ -567,10 +506,6 @@ function executeTrade(direction) {
                     reject(error);
                 }
             });
-
-            // -----------------------------------------
-            // CERRAR
-            // -----------------------------------------
 
             ws.on("close", () => {
 
@@ -615,6 +550,39 @@ app.get("/", (req, res) => {
         account:
             "AUTO-DEMO"
     });
+});
+
+// =====================================================
+// PRUEBA DE CUENTA - NO OPERA
+// =====================================================
+
+app.get("/account-test", async (req, res) => {
+
+    try {
+
+        const accountId =
+            await getAccountId();
+
+        res.json({
+
+            success: true,
+
+            mode: "DEMO",
+
+            account_id:
+                accountId
+        });
+
+    } catch (error) {
+
+        res.status(500).json({
+
+            success: false,
+
+            error:
+                error.message
+        });
+    }
 });
 
 // =====================================================
