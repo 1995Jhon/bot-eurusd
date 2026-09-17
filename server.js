@@ -1,1554 +1,214 @@
-const express = require("express");
-const cors = require("cors");
-const WebSocket = require("ws");
-
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-const PORT = process.env.PORT || 3000;
-
-const API_BASE = "https://api.derivws.com";
-
-const PUBLIC_WS =
-  "wss://api.derivws.com/trading/v1/options/ws/public";
-
-const SYMBOL = "frxEURUSD";
-const AMOUNT = 1;
-
-// DEMO solamente
-const MAX_TRADES_PER_HOUR = 5;
-
-// Para esta prueba usamos 5 TICKS.
-// Evitamos las duraciones en minutos que Deriv estaba rechazando.
-const DURATION = 5;
-const DURATION_UNIT = "t";
-
-const DERIV_TOKEN =
-  process.env.DERIV_TOKEN;
-
-const DERIV_APP_ID =
-  process.env.DERIV_APP_ID;
-
-const AUTO_TRADING =
-  process.env.AUTO_TRADING !== "false";
-
-let tradesThisHour = 0;
-let hourStarted = Date.now();
-
-let lastTradeCandle = null;
-let autoBusy = false;
-
-let lastSignal = "NO_TRADE";
-let lastTrade = null;
-let lastAutoRun = null;
-
-/* =========================
-   CONFIG
-========================= */
-
-function checkConfig() {
-  if (!DERIV_TOKEN) {
-    throw new Error("Falta DERIV_TOKEN");
-  }
-
-  if (!DERIV_APP_ID) {
-    throw new Error("Falta DERIV_APP_ID");
-  }
-}
-
-/* =========================
-   CONTADOR
-========================= */
-
-function resetHourlyCounter() {
-  const hour = 60 * 60 * 1000;
-
-  if (
-    Date.now() - hourStarted >=
-    hour
-  ) {
-    tradesThisHour = 0;
-    hourStarted = Date.now();
-
-    console.log(
-      "AUTO | Contador horario reiniciado"
-    );
-  }
-}
-
-/* =========================
-   IDENTIFICADOR DE VELA
-========================= */
-
-function getCandleId() {
-  return Math.floor(
-    Date.now() /
-      (5 * 60 * 1000)
-  );
-}
-
-/* =========================
-   CUENTA DEMO
-========================= */
-
-async function getDemoAccount() {
-  checkConfig();
-
-  const response =
-    await fetch(
-      `${API_BASE}/trading/v1/options/accounts`,
-      {
-        method: "GET",
-
-        headers: {
-          Authorization:
-            `Bearer ${DERIV_TOKEN}`,
-
-          "Deriv-App-ID":
-            DERIV_APP_ID,
-
-          Accept:
-            "application/json"
-        }
-      }
-    );
-
-  const data =
-    await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.errors?.[0]?.message ||
-      "No se pudieron obtener las cuentas"
-    );
-  }
-
-  let accounts =
-    data.data || [];
-
-  if (!Array.isArray(accounts)) {
-    accounts = [accounts];
-  }
-
-  const demo =
-    accounts.find(
-      account =>
-        account.account_type ===
-          "demo" &&
-        account.status ===
-          "active"
-    );
-
-  if (!demo?.account_id) {
-    throw new Error(
-      "No se encontró una cuenta DEMO activa"
-    );
-  }
-
-  console.log(
-    `Cuenta DEMO: ${demo.account_id}`
-  );
-
-  return demo.account_id;
-}
-
-/* =========================
-   OTP PARA WEBSOCKET DEMO
-========================= */
-
-async function getDemoWebSocket(
-  accountId
-) {
-  checkConfig();
-
-  const response =
-    await fetch(
-      `${API_BASE}/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`,
-      {
-        method: "POST",
-
-        headers: {
-          Authorization:
-            `Bearer ${DERIV_TOKEN}`,
-
-          "Deriv-App-ID":
-            DERIV_APP_ID,
-
-          Accept:
-            "application/json"
-        }
-      }
-    );
-
-  const data =
-    await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.errors?.[0]?.message ||
-      "No se pudo obtener OTP"
-    );
-  }
-
-  const url =
-    data?.data?.url;
-
-  if (!url) {
-    throw new Error(
-      "Deriv no devolvió la URL DEMO"
-    );
-  }
-
-  console.log(
-    "WebSocket DEMO obtenido"
-  );
-
-  return url;
-}
-
-/* =========================
-   CONTRATOS DISPONIBLES
-========================= */
-
-function checkContracts() {
-  return new Promise(
-    (resolve, reject) => {
-
-      const ws =
-        new WebSocket(
-          PUBLIC_WS
-        );
-
-      let finished = false;
-
-      const timeout =
-        setTimeout(
-          () => {
-            finishReject(
-              new Error(
-                "Timeout consultando contratos"
-              )
-            );
-          },
-          15000
-        );
-
-      function finishResolve(
-        value
-      ) {
-        if (finished) return;
-
-        finished = true;
-
-        clearTimeout(
-          timeout
-        );
-
-        try {
-          ws.close();
-        } catch {}
-
-        resolve(value);
-      }
-
-      function finishReject(
-        error
-      ) {
-        if (finished) return;
-
-        finished = true;
-
-        clearTimeout(
-          timeout
-        );
-
-        try {
-          ws.close();
-        } catch {}
-
-        reject(error);
-      }
-
-      ws.on(
-        "open",
-        () => {
-
-          console.log(
-            "Mercado | Consultando contratos EUR/USD..."
-          );
-
-          ws.send(
-            JSON.stringify({
-              contracts_for:
-                SYMBOL,
-
-              req_id:
-                10
-            })
-          );
-        }
-      );
-
-      ws.on(
-        "message",
-        raw => {
-
-          try {
-
-            const data =
-              JSON.parse(
-                raw.toString()
-              );
-
-            if (data.error) {
-              return finishReject(
-                new Error(
-                  data.error.message ||
-                  "Error consultando contratos"
-                )
-              );
-            }
-
-            if (
-              data.msg_type ===
-              "contracts_for"
-            ) {
-
-              const available =
-                data
-                  .contracts_for
-                  ?.available || [];
-
-              const types =
-                available
-                  .map(
-                    item =>
-                      item.contract_type
-                  )
-                  .filter(Boolean);
-
-              console.log(
-                `Mercado | Contratos: ${types.join(", ")}`
-              );
-
-              const call =
-                available.some(
-                  item =>
-                    item.contract_type ===
-                    "CALL"
-                );
-
-              const put =
-                available.some(
-                  item =>
-                    item.contract_type ===
-                    "PUT"
-                );
-
-              finishResolve({
-                call,
-                put
-              });
-            }
-
-          } catch (error) {
-            finishReject(error);
-          }
-        }
-      );
-
-      ws.on(
-        "error",
-        error => {
-          finishReject(error);
-        }
-      );
+"""
+Bot de SEÑALES (no ejecuta operaciones) para EUR/USD.
+Analiza velas, calcula EMA9/EMA21 + RSI14 + MACD + ATR,
+y envía un aviso a Telegram cuando las condiciones se alinean.
+
+La ejecución de la operación (Comprar/Vender) la hacés VOS,
+a mano, en tu plataforma (World Binary, IQ Option, etc.).
+
+Requisitos:
+    pip install requests pandas numpy
+
+Variables de entorno necesarias (configuralas en Render o en tu .env):
+    TWELVE_DATA_API_KEY   -> API key gratuita de https://twelvedata.com
+    TELEGRAM_BOT_TOKEN    -> token de tu bot de Telegram (via @BotFather)
+    TELEGRAM_CHAT_ID      -> tu chat id (via @userinfobot, por ejemplo)
+
+    Opcionales:
+    SYMBOL          (default "EUR/USD")
+    INTERVAL        (default "5min")   -> 1min, 5min, 15min, etc.
+    POLL_SECONDS    (default 60)       -> cada cuánto revisa el mercado
+"""
+
+import os
+import time
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ---------- Configuración ----------
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+SYMBOL = os.environ.get("SYMBOL", "EUR/USD")
+INTERVAL = os.environ.get("INTERVAL", "5min")
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
+# Evita mandar la misma señal repetida vela tras vela
+last_signal_sent = None
+last_candle_time = None
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("⚠️  Telegram no configurado, no se envía mensaje.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+        if r.status_code != 200:
+            log(f"⚠️  Error enviando Telegram: {r.text}")
+    except Exception as e:
+        log(f"⚠️  Excepción enviando Telegram: {e}")
+
+
+def fetch_candles(symbol: str, interval: str, outputsize: int = 100) -> pd.DataFrame:
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
     }
-  );
-}
+    r = requests.get(TWELVE_DATA_URL, params=params, timeout=15)
+    data = r.json()
+    if "values" not in data:
+        raise RuntimeError(f"Error de Twelve Data: {data}")
+    df = pd.DataFrame(data["values"])
+    df = df.rename(columns={"datetime": "time"})
+    df["time"] = pd.to_datetime(df["time"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    df = df.sort_values("time").reset_index(drop=True)
+    return df
 
-/* =========================
-   VELAS
-========================= */
 
-function getCandles() {
-  return new Promise(
-    (resolve, reject) => {
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["close"]
 
-      const ws =
-        new WebSocket(
-          PUBLIC_WS
-        );
+    # EMA
+    df["ema9"] = close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = close.ewm(span=21, adjust=False).mean()
 
-      let finished = false;
+    # RSI14
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi14"] = 100 - (100 / (1 + rs))
 
-      const timeout =
-        setTimeout(
-          () => {
-            finishReject(
-              new Error(
-                "Timeout obteniendo EUR/USD"
-              )
-            );
-          },
-          15000
-        );
+    # MACD (12,26,9)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-      function finishResolve(
-        value
-      ) {
-        if (finished) return;
+    # ATR14 (volatilidad)
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - close.shift()).abs()
+    low_close = (df["low"] - close.shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr14"] = tr.rolling(14).mean()
 
-        finished = true;
+    return df
 
-        clearTimeout(
-          timeout
-        );
 
-        try {
-          ws.close();
-        } catch {}
+def generate_signal(df: pd.DataFrame) -> dict:
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-        resolve(value);
-      }
+    ema_cross_up = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
+    ema_cross_down = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
 
-      function finishReject(
-        error
-      ) {
-        if (finished) return;
+    rsi_ok_buy = 40 < last["rsi14"] < 70   # evita sobrecompra extrema
+    rsi_ok_sell = 30 < last["rsi14"] < 60  # evita sobreventa extrema
 
-        finished = true;
+    macd_bullish = last["macd_hist"] > 0
+    macd_bearish = last["macd_hist"] < 0
 
-        clearTimeout(
-          timeout
-        );
+    # Filtro de volatilidad: si el ATR está muy bajo respecto al promedio
+    # reciente, el mercado está plano -> no vale la pena operar.
+    atr_mean = df["atr14"].tail(20).mean()
+    volatility_ok = last["atr14"] >= 0.6 * atr_mean if not np.isnan(atr_mean) else False
 
-        try {
-          ws.close();
-        } catch {}
+    signal = "NO_TRADE"
+    reason = "Sin alineación de condiciones"
 
-        reject(error);
-      }
+    if ema_cross_up and rsi_ok_buy and macd_bullish and volatility_ok:
+        signal = "BUY"
+        reason = "Cruce EMA9>EMA21 + RSI neutral-alcista + MACD positivo + volatilidad ok"
+    elif ema_cross_down and rsi_ok_sell and macd_bearish and volatility_ok:
+        signal = "SELL"
+        reason = "Cruce EMA9<EMA21 + RSI neutral-bajista + MACD negativo + volatilidad ok"
+    elif not volatility_ok:
+        reason = "Mercado con baja volatilidad (lateral), se descarta señal"
 
-      ws.on(
-        "open",
-        () => {
-
-          console.log(
-            "Mercado EUR/USD conectado"
-          );
-
-          ws.send(
-            JSON.stringify({
-              ticks_history:
-                SYMBOL,
-
-              end:
-                "latest",
-
-              count:
-                100,
-
-              style:
-                "candles",
-
-              granularity:
-                300,
-
-              req_id:
-                20
-            })
-          );
-        }
-      );
-
-      ws.on(
-        "message",
-        raw => {
-
-          try {
-
-            const data =
-              JSON.parse(
-                raw.toString()
-              );
-
-            if (data.error) {
-              return finishReject(
-                new Error(
-                  data.error.message ||
-                  "Error de mercado"
-                )
-              );
-            }
-
-            if (
-              data.msg_type ===
-                "candles" &&
-              Array.isArray(
-                data.candles
-              )
-            ) {
-
-              const candles =
-                data.candles
-                  .map(
-                    candle => ({
-                      open:
-                        Number(
-                          candle.open
-                        ),
-
-                      high:
-                        Number(
-                          candle.high
-                        ),
-
-                      low:
-                        Number(
-                          candle.low
-                        ),
-
-                      close:
-                        Number(
-                          candle.close
-                        ),
-
-                      epoch:
-                        Number(
-                          candle.epoch
-                        )
-                    })
-                  )
-                  .filter(
-                    candle =>
-                      Number.isFinite(
-                        candle.close
-                      )
-                  );
-
-              if (
-                candles.length <
-                30
-              ) {
-                return finishReject(
-                  new Error(
-                    "No hay suficientes velas"
-                  )
-                );
-              }
-
-              console.log(
-                `Mercado | ${candles.length} velas recibidas`
-              );
-
-              finishResolve(
-                candles
-              );
-            }
-
-          } catch (error) {
-            finishReject(error);
-          }
-        }
-      );
-
-      ws.on(
-        "error",
-        error => {
-          finishReject(error);
-        }
-      );
+    return {
+        "signal": signal,
+        "reason": reason,
+        "close": last["close"],
+        "ema9": last["ema9"],
+        "ema21": last["ema21"],
+        "rsi14": last["rsi14"],
+        "macd_hist": last["macd_hist"],
+        "atr14": last["atr14"],
+        "time": last["time"],
     }
-  );
-}
 
-/* =========================
-   EMA
-========================= */
 
-function ema(
-  values,
-  period
-) {
+def run_once():
+    global last_signal_sent, last_candle_time
 
-  if (
-    values.length <
-    period
-  ) {
-    return null;
-  }
+    df = fetch_candles(SYMBOL, INTERVAL)
+    df = compute_indicators(df)
+    result = generate_signal(df)
 
-  const multiplier =
-    2 /
-    (period + 1);
+    candle_time = result["time"]
 
-  let result =
-    values
-      .slice(
-        0,
-        period
-      )
-      .reduce(
-        (
-          sum,
-          value
-        ) =>
-          sum + value,
-        0
-      ) /
-    period;
-
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-
-    result =
-      values[i] *
-        multiplier +
-      result *
-        (1 - multiplier);
-  }
-
-  return result;
-}
-
-/* =========================
-   RSI
-========================= */
-
-function rsi(
-  values,
-  period = 14
-) {
-
-  if (
-    values.length <=
-    period
-  ) {
-    return null;
-  }
-
-  let gains = 0;
-  let losses = 0;
-
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
-    const change =
-      values[i] -
-      values[i - 1];
-
-    if (
-      change >= 0
-    ) {
-      gains += change;
-    } else {
-      losses +=
-        Math.abs(change);
-    }
-  }
-
-  let averageGain =
-    gains / period;
-
-  let averageLoss =
-    losses / period;
-
-  for (
-    let i =
-      period + 1;
-    i < values.length;
-    i++
-  ) {
-
-    const change =
-      values[i] -
-      values[i - 1];
-
-    const gain =
-      Math.max(
-        change,
-        0
-      );
-
-    const loss =
-      Math.max(
-        -change,
-        0
-      );
-
-    averageGain =
-      (
-        averageGain *
-          (period - 1) +
-        gain
-      ) /
-      period;
-
-    averageLoss =
-      (
-        averageLoss *
-          (period - 1) +
-        loss
-      ) /
-      period;
-  }
-
-  if (
-    averageLoss ===
-    0
-  ) {
-    return 100;
-  }
-
-  const rs =
-    averageGain /
-    averageLoss;
-
-  return (
-    100 -
-    100 /
-      (1 + rs)
-  );
-}
-
-/* =========================
-   SEÑAL
-========================= */
-
-function getSignal(
-  candles
-) {
-
-  const closes =
-    candles.map(
-      candle =>
-        candle.close
-    );
-
-  const ema9 =
-    ema(
-      closes,
-      9
-    );
-
-  const ema21 =
-    ema(
-      closes,
-      21
-    );
-
-  const current =
-    closes[
-      closes.length - 1
-    ];
-
-  const previous =
-    closes[
-      closes.length - 2
-    ];
-
-  const currentRsi =
-    rsi(
-      closes,
-      14
-    );
-
-  console.log(
-    `AUTO | EMA9=${ema9?.toFixed(6)}`
-  );
-
-  console.log(
-    `AUTO | EMA21=${ema21?.toFixed(6)}`
-  );
-
-  console.log(
-    `AUTO | RSI14=${currentRsi?.toFixed(2)}`
-  );
-
-  if (
-    ![
-      ema9,
-      ema21,
-      current,
-      previous,
-      currentRsi
-    ].every(
-      Number.isFinite
+    log(
+        f"{SYMBOL} | close={result['close']:.5f} EMA9={result['ema9']:.5f} "
+        f"EMA21={result['ema21']:.5f} RSI={result['rsi14']:.2f} "
+        f"MACDhist={result['macd_hist']:.6f} ATR={result['atr14']:.5f} "
+        f"=> {result['signal']}"
     )
-  ) {
-    return null;
-  }
 
-  if (
-    ema9 > ema21 &&
-    currentRsi >= 50 &&
-    currentRsi <= 70 &&
-    current > previous
-  ) {
-    return "CALL";
-  }
-
-  if (
-    ema9 < ema21 &&
-    currentRsi >= 30 &&
-    currentRsi <= 50 &&
-    current < previous
-  ) {
-    return "PUT";
-  }
-
-  return null;
-}
-
-/* =========================
-   OPERACIÓN DEMO
-========================= */
-
-function executeTrade(
-  direction
-) {
-
-  return new Promise(
-    async (
-      resolve,
-      reject
-    ) => {
-
-      let ws = null;
-
-      try {
-
-        resetHourlyCounter();
-
-        if (
-          tradesThisHour >=
-          MAX_TRADES_PER_HOUR
-        ) {
-          throw new Error(
-            "Límite de 5 operaciones por hora"
-          );
-        }
-
-        const candleId =
-          getCandleId();
-
-        if (
-          lastTradeCandle ===
-          candleId
-        ) {
-          throw new Error(
-            "Ya hubo una operación en esta vela"
-          );
-        }
-
-        console.log(
-          "DEMO | Verificando CALL/PUT..."
-        );
-
-        const contracts =
-          await checkContracts();
-
-        if (
-          direction ===
-            "CALL" &&
-          !contracts.call
-        ) {
-          throw new Error(
-            "CALL no está disponible para EUR/USD"
-          );
-        }
-
-        if (
-          direction ===
-            "PUT" &&
-          !contracts.put
-        ) {
-          throw new Error(
-            "PUT no está disponible para EUR/USD"
-          );
-        }
-
-        const accountId =
-          await getDemoAccount();
-
-        const wsUrl =
-          await getDemoWebSocket(
-            accountId
-          );
-
-        ws =
-          new WebSocket(
-            wsUrl
-          );
-
-        let finished =
-          false;
-
-        const timeout =
-          setTimeout(
-            () => {
-
-              if (
-                finished
-              ) {
-                return;
-              }
-
-              finished = true;
-
-              try {
-                ws.close();
-              } catch {}
-
-              reject(
-                new Error(
-                  "Timeout con Deriv"
-                )
-              );
-
-            },
-            30000
-          );
-
-        function finishResolve(
-          result
-        ) {
-
-          if (
-            finished
-          ) {
-            return;
-          }
-
-          finished = true;
-
-          clearTimeout(
-            timeout
-          );
-
-          try {
-            ws.close();
-          } catch {}
-
-          resolve(
-            result
-          );
-        }
-
-        function finishReject(
-          error
-        ) {
-
-          if (
-            finished
-          ) {
-            return;
-          }
-
-          finished = true;
-
-          clearTimeout(
-            timeout
-          );
-
-          try {
-            ws.close();
-          } catch {}
-
-          reject(
-            error
-          );
-        }
-
-        ws.on(
-          "open",
-          () => {
-
-            console.log(
-              `DEMO | WebSocket conectado | ${direction}`
-            );
-
-            console.log(
-              `DEMO | Solicitando propuesta: ${DURATION} ticks`
-            );
-
-            ws.send(
-              JSON.stringify({
-
-                proposal:
-                  1,
-
-                amount:
-                  AMOUNT,
-
-                basis:
-                  "stake",
-
-                contract_type:
-                  direction,
-
-                currency:
-                  "USD",
-
-                duration:
-                  DURATION,
-
-                duration_unit:
-                  DURATION_UNIT,
-
-                underlying_symbol:
-                  SYMBOL,
-
-                subscribe:
-                  1,
-
-                req_id:
-                  50
-
-              })
-            );
-          }
-        );
-
-        ws.on(
-          "message",
-          raw => {
-
-            try {
-
-              const data =
-                JSON.parse(
-                  raw.toString()
-                );
-
-              if (
-                data.error
-              ) {
-
-                return finishReject(
-                  new Error(
-                    data.error.message ||
-                    "Error de Deriv"
-                  )
-                );
-              }
-
-              if (
-                data.msg_type ===
-                  "proposal" &&
-                data.proposal?.id
-              ) {
-
-                const proposalId =
-                  data.proposal.id;
-
-                const askPrice =
-                  Number(
-                    data.proposal.ask_price
-                  );
-
-                if (
-                  !Number.isFinite(
-                    askPrice
-                  )
-                ) {
-                  return finishReject(
-                    new Error(
-                      "Deriv no devolvió un precio válido"
-                    )
-                  );
-                }
-
-                console.log(
-                  "DEMO | PROPUESTA RECIBIDA"
-                );
-
-                console.log(
-                  `DEMO | Precio: $${askPrice}`
-                );
-
-                console.log(
-                  "DEMO | Comprando propuesta..."
-                );
-
-                ws.send(
-                  JSON.stringify({
-
-                    buy:
-                      proposalId,
-
-                    price:
-                      askPrice,
-
-                    req_id:
-                      51
-
-                  })
-                );
-
-                return;
-              }
-
-              if (
-                data.msg_type ===
-                  "buy" &&
-                data.buy?.contract_id
-              ) {
-
-                const contractId =
-                  data.buy.contract_id;
-
-                tradesThisHour++;
-
-                lastTradeCandle =
-                  getCandleId();
-
-                lastTrade = {
-
-                  time:
-                    new Date()
-                      .toISOString(),
-
-                  direction:
-                    direction,
-
-                  amount:
-                    AMOUNT,
-
-                  duration:
-                    DURATION,
-
-                  duration_unit:
-                    DURATION_UNIT,
-
-                  contract_id:
-                    contractId,
-
-                  account:
-                    accountId,
-
-                  status:
-                    "DEMO_CONFIRMED"
-
-                };
-
-                console.log(
-                  "================================"
-                );
-
-                console.log(
-                  "OPERACIÓN DEMO CONFIRMADA"
-                );
-
-                console.log(
-                  `DEMO | Dirección: ${direction}`
-                );
-
-                console.log(
-                  `DEMO | Monto: $${AMOUNT}`
-                );
-
-                console.log(
-                  `DEMO | Duración: ${DURATION} ticks`
-                );
-
-                console.log(
-                  `DEMO | Contract ID: ${contractId}`
-                );
-
-                console.log(
-                  `DEMO | Operaciones: ${tradesThisHour}/${MAX_TRADES_PER_HOUR}`
-                );
-
-                console.log(
-                  "================================"
-                );
-
-                return finishResolve(
-                  lastTrade
-                );
-              }
-
-            } catch (error) {
-
-              finishReject(
-                error
-              );
-            }
-          }
-        );
-
-        ws.on(
-          "error",
-          error => {
-
-            finishReject(
-              error
-            );
-          }
-        );
-
-      } catch (
-        error
-      ) {
-
-        reject(
-          error
-        );
-      }
-    }
-  );
-}
-
-/* =========================
-   BOT AUTOMÁTICO
-========================= */
-
-async function runAutoTrader() {
-
-  if (
-    !AUTO_TRADING
-  ) {
-
-    console.log(
-      "AUTO | Trading automático desactivado"
-    );
-
-    return;
-  }
-
-  if (
-    autoBusy
-  ) {
-
-    console.log(
-      "AUTO | Análisis anterior activo"
-    );
-
-    return;
-  }
-
-  autoBusy = true;
-
-  lastAutoRun =
-    new Date()
-      .toISOString();
-
-  try {
-
-    resetHourlyCounter();
-
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      "AUTO | Analizando EUR/USD..."
-    );
-
-    const candles =
-      await getCandles();
-
-    const signal =
-      getSignal(
-        candles
-      );
-
-    lastSignal =
-      signal ||
-      "NO_TRADE";
-
-    console.log(
-      `AUTO | SEÑAL=${lastSignal}`
-    );
-
-    if (
-      !signal
-    ) {
-
-      console.log(
-        "AUTO | Sin operación"
-      );
-
-      return;
-    }
-
-    console.log(
-      `AUTO | Señal ${signal}`
-    );
-
-    console.log(
-      "AUTO | Ejecutando DEMO $1"
-    );
-
-    await executeTrade(
-      signal
-    );
-
-  } catch (
-    error
-  ) {
-
-    console.log(
-      `AUTO | ERROR: ${error.message}`
-    );
-
-  } finally {
-
-    autoBusy = false;
-
-    console.log(
-      "================================"
-    );
-  }
-}
-
-/* =========================
-   PÁGINA
-========================= */
-
-app.get(
-  "/",
-  (req, res) => {
-
-    res.json({
-
-      bot:
-        "EUR/USD DEMO",
-
-      status:
-        "running",
-
-      mode:
-        "DEMO",
-
-      symbol:
-        SYMBOL,
-
-      amount:
-        AMOUNT,
-
-      duration:
-        DURATION,
-
-      duration_unit:
-        DURATION_UNIT,
-
-      auto_trading:
-        AUTO_TRADING,
-
-      max_trades_per_hour:
-        MAX_TRADES_PER_HOUR,
-
-      last_signal:
-        lastSignal,
-
-      last_auto_run:
-        lastAutoRun,
-
-      last_trade:
-        lastTrade
-
-    });
-  }
-);
-
-/* =========================
-   TEST CUENTA
-========================= */
-
-app.get(
-  "/account-test",
-  async (
-    req,
-    res
-  ) => {
-
-    try {
-
-      const account =
-        await getDemoAccount();
-
-      res.json({
-
-        ok:
-          true,
-
-        mode:
-          "DEMO",
-
-        account:
-          account
-
-      });
-
-    } catch (
-      error
-    ) {
-
-      res.status(
-        500
-      ).json({
-
-        ok:
-          false,
-
-        error:
-          error.message
-
-      });
-    }
-  }
-);
-
-/* =========================
-   TRADE MANUAL DEMO
-========================= */
-
-app.post(
-  "/trade",
-  async (
-    req,
-    res
-  ) => {
-
-    try {
-
-      const direction =
-        String(
-          req.body?.direction ||
-          ""
-        ).toUpperCase();
-
-      if (
-        direction !==
-          "CALL" &&
-        direction !==
-          "PUT"
-      ) {
-
-        return res.status(
-          400
-        ).json({
-
-          ok:
-            false,
-
-          error:
-            "direction debe ser CALL o PUT"
-
-        });
-      }
-
-      const result =
-        await executeTrade(
-          direction
-        );
-
-      res.json({
-
-        ok:
-          true,
-
-        result:
-          result
-
-      });
-
-    } catch (
-      error
-    ) {
-
-      res.status(
-        500
-      ).json({
-
-        ok:
-          false,
-
-        error:
-          error.message
-
-      });
-    }
-  }
-);
-
-/* =========================
-   SERVIDOR
-========================= */
-
-app.listen(
-  PORT,
-  () => {
-
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      "BOT EUR/USD INICIADO"
-    );
-
-    console.log(
-      `Puerto: ${PORT}`
-    );
-
-    console.log(
-      "Modo: DEMO"
-    );
-
-    console.log(
-      `Símbolo: ${SYMBOL}`
-    );
-
-    console.log(
-      `Monto: $${AMOUNT}`
-    );
-
-    console.log(
-      `Duración: ${DURATION} ticks`
-    );
-
-    console.log(
-      `Máximo: ${MAX_TRADES_PER_HOUR} operaciones/hora`
-    );
-
-    console.log(
-      `DERIV_TOKEN configurado: ${Boolean(DERIV_TOKEN)}`
-    );
-
-    console.log(
-      `DERIV_APP_ID configurado: ${Boolean(DERIV_APP_ID)}`
-    );
-
-    console.log(
-      "================================"
-    );
-
-    if (
-      AUTO_TRADING
-    ) {
-
-      console.log(
-        "AUTO | Monitor iniciado"
-      );
-
-      runAutoTrader();
-
-      setInterval(
-        runAutoTrader,
-        5 * 60 * 1000
-      );
-    }
-  }
-);
+    # Evita reenviar la misma señal para la misma vela
+    if candle_time == last_candle_time:
+        return
+
+    last_candle_time = candle_time
+
+    if result["signal"] in ("BUY", "SELL") and result["signal"] != last_signal_sent:
+        emoji = "🟢" if result["signal"] == "BUY" else "🔴"
+        msg = (
+            f"{emoji} SEÑAL {result['signal']} - {SYMBOL} ({INTERVAL})\n"
+            f"Precio: {result['close']:.5f}\n"
+            f"Motivo: {result['reason']}\n"
+            f"RSI14: {result['rsi14']:.1f} | MACD hist: {result['macd_hist']:.6f}\n"
+            f"Hora vela: {candle_time}\n\n"
+            f"⚠️ Señal de análisis técnico, no es garantía de resultado. "
+            f"La decisión y ejecución son tuyas."
+        )
+        send_telegram(msg)
+        last_signal_sent = result["signal"]
+    elif result["signal"] == "NO_TRADE":
+        last_signal_sent = None  # resetea para poder volver a avisar cuando aparezca señal
+
+
+def main():
+    log(f"Iniciando bot de señales para {SYMBOL} ({INTERVAL})")
+    if not TWELVE_DATA_API_KEY:
+        log("❌ Falta TWELVE_DATA_API_KEY. El bot no puede pedir datos de mercado.")
+        return
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            log(f"❌ Error en el ciclo: {e}")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
